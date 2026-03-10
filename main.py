@@ -28,7 +28,7 @@ import pandas as pd
 import shap
 from sklearn.decomposition import PCA
 from sklearn.ensemble import IsolationForest
-from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.preprocessing import StandardScaler
 
 # ============================================================
 # モジュールレベルロガー（setup_logging() で初期化）
@@ -53,7 +53,8 @@ class Config:
     # --- 前処理 ---
     missing_rate_threshold: float = 0.50    # 欠損率除外閾値
     date_parse_threshold: float = 0.80      # 日付判定の成功率閾値
-    high_cardinality_threshold: float = 0.50  # 高カーディナリティ判定閾値
+    ohe_top_n: int = 10                     # OHE対象とする上位カテゴリ数
+    ohe_coverage_threshold: float = 0.50    # 上位N件のカバレッジ閾値（超えたらOHE）
     variance_threshold: float = 0.01        # 低分散除外閾値
     corr_threshold: float = 0.95            # 高相関除外閾値
 
@@ -235,9 +236,12 @@ def _encode_column(
     """単一の object 型カラムを型判定してエンコードする。
 
     優先順位:
-      1. 日付パース成功率 >= date_parse_threshold → datetime 分解
-      2. unique 比率 <= high_cardinality_threshold → LabelEncoding
-      3. それ以外 → 頻度エンコーディング
+      1. 日付パース成功率 >= date_parse_threshold
+             → datetime 分解（年/月/日/時/曜日）
+      2. 上位 ohe_top_n カテゴリのカバレッジ >= ohe_coverage_threshold
+             → 上位 N カテゴリを One-Hot Encoding、残りを "__other__"
+      3. それ以外（高カーディナリティ）
+             → 頻度エンコーディング
 
     Args:
         df: 処理対象DataFrame
@@ -281,26 +285,36 @@ def _encode_column(
         df[col] = df[col].fillna(fill_val)
         logger.debug(f"  欠損補完 [{col}]: {n_null}件 → '{fill_val}'")
 
-    # ---- カーディナリティ判定 ----
-    n_unique = df[col].nunique()
-    unique_ratio = n_unique / n_rows
+    # ---- カバレッジ判定 ----
+    freq = df[col].value_counts(normalize=True)
+    top_n_cats = freq.nlargest(cfg.ohe_top_n).index.tolist()
+    coverage = float(freq.nlargest(cfg.ohe_top_n).sum())
     logger.debug(
-        f"  カーディナリティ [{col}]: unique={n_unique}, "
-        f"ratio={unique_ratio:.3f} (閾値={cfg.high_cardinality_threshold})"
+        f"  カバレッジ [{col}]: top{cfg.ohe_top_n}={coverage:.3f} "
+        f"(閾値={cfg.ohe_coverage_threshold}), unique={df[col].nunique()}"
     )
+    logger.debug(f"  top{cfg.ohe_top_n} カテゴリ: {top_n_cats}")
 
-    if unique_ratio <= cfg.high_cardinality_threshold:
-        le = LabelEncoder()
-        sample_classes = df[col].unique()[:5].tolist()
-        df[col] = le.fit_transform(df[col].astype(str))
-        logger.debug(
-            f"  LabelEncoding [{col}]: classes(先頭5)={sample_classes}"
+    if coverage >= cfg.ohe_coverage_threshold:
+        # 上位N件以外を "__other__" に置き換えてから OHE
+        other_count = int((~df[col].isin(top_n_cats)).sum())
+        df[col] = df[col].where(df[col].isin(top_n_cats), other="__other__")
+        dummies = pd.get_dummies(df[col], prefix=col, dtype=int)
+        df = df.drop(columns=[col])
+        df = pd.concat([df, dummies], axis=1)
+        logger.info(
+            f"  OHE [{col}]: top{cfg.ohe_top_n}カテゴリ + __other__({other_count}件) "
+            f"→ {len(dummies.columns)}列生成"
         )
+        logger.debug(f"  生成列: {dummies.columns.tolist()}")
     else:
-        freq_map = df[col].value_counts(normalize=True)
-        df[col] = df[col].map(freq_map)
-        logger.info(f"  高カーディナリティ → 頻度エンコード: {col}")
-        logger.debug(f"  頻度 top5:\n{freq_map.head().to_string()}")
+        # 高カーディナリティ → 頻度エンコーディング
+        df[col] = df[col].map(freq)
+        logger.info(
+            f"  高カーディナリティ → 頻度エンコード: {col} "
+            f"(coverage={coverage:.3f} < {cfg.ohe_coverage_threshold})"
+        )
+        logger.debug(f"  頻度 top5:\n{freq.head().to_string()}")
 
     return df
 
