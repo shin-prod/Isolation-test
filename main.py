@@ -14,6 +14,7 @@ Isolation Forest + SHAP + PCA可視化 (Tableau連携)
 - 各ステップで DataFrame 統計・カラム詳細を DEBUG 出力
 """
 
+import argparse
 import logging
 import sys
 import time
@@ -821,9 +822,68 @@ def save_outputs(
 # メイン処理
 # ============================================================
 
+def _parse_args() -> argparse.Namespace:
+    """コマンドライン引数を解析する。"""
+    parser = argparse.ArgumentParser(
+        description="異常検知システム (Isolation Forest + SHAP + PCA)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    # --- パス ---
+    parser.add_argument("--in-dir", type=Path, default=Path("in"),
+                        help="入力CSVフォルダのパス")
+    parser.add_argument("--out-dir", type=Path, default=Path("out"),
+                        help="出力フォルダのパス")
+
+    # --- Isolation Forest ---
+    parser.add_argument("--contamination", type=float, default=0.05,
+                        help="異常割合の想定値 (0.0〜0.5)")
+    parser.add_argument("--n-estimators", type=int, default=200,
+                        help="Isolation Forestの木の本数")
+
+    # --- 前処理 ---
+    parser.add_argument("--missing-rate-threshold", type=float, default=0.80,
+                        help="欠損率がこの値を超えるカラムを除外")
+    parser.add_argument("--ohe-top-n", type=int, default=10,
+                        help="OHE対象とする上位カテゴリ数")
+    parser.add_argument("--ohe-coverage-threshold", type=float, default=0.50,
+                        help="上位N件のカバレッジがこの値以上ならOHE")
+    parser.add_argument("--variance-threshold", type=float, default=0.01,
+                        help="分散がこの値未満のカラムを除外")
+    parser.add_argument("--corr-threshold", type=float, default=0.95,
+                        help="相関係数がこの値を超えるペアの片方を除外")
+
+    # --- SHAP ---
+    parser.add_argument("--shap-all", action="store_true", default=True,
+                        help="全件SHAPを計算する（デフォルト: True）")
+    parser.add_argument("--shap-anomaly-only", action="store_true", default=False,
+                        help="異常レコードのみSHAP計算する（--shap-all を上書き）")
+
+    # --- PCA ---
+    parser.add_argument("--pca-variance-warning", type=float, default=0.50,
+                        help="PCA累積寄与率がこの値を下回ると警告")
+
+    return parser.parse_args()
+
+
 def main() -> None:
     """異常検知システムのメイン処理を実行する。"""
-    cfg = Config()
+    args = _parse_args()
+
+    cfg = Config(
+        in_dir=args.in_dir,
+        out_dir=args.out_dir,
+        contamination=args.contamination,
+        n_estimators=args.n_estimators,
+        missing_rate_threshold=args.missing_rate_threshold,
+        ohe_top_n=args.ohe_top_n,
+        ohe_coverage_threshold=args.ohe_coverage_threshold,
+        variance_threshold=args.variance_threshold,
+        corr_threshold=args.corr_threshold,
+        shap_all=not args.shap_anomaly_only,
+        pca_variance_warning=args.pca_variance_warning,
+    )
+
     setup_logging(cfg.out_dir)
 
     logger.info("=" * 60)
@@ -831,6 +891,11 @@ def main() -> None:
     logger.info(
         f"設定: contamination={cfg.contamination}, "
         f"n_estimators={cfg.n_estimators}, "
+        f"ohe_top_n={cfg.ohe_top_n}, "
+        f"ohe_coverage_threshold={cfg.ohe_coverage_threshold}, "
+        f"missing_rate_threshold={cfg.missing_rate_threshold}, "
+        f"variance_threshold={cfg.variance_threshold}, "
+        f"corr_threshold={cfg.corr_threshold}, "
         f"shap_all={cfg.shap_all}"
     )
     logger.info("=" * 60)
