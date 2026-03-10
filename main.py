@@ -854,10 +854,8 @@ def _parse_args() -> argparse.Namespace:
                         help="相関係数がこの値を超えるペアの片方を除外")
 
     # --- SHAP ---
-    parser.add_argument("--shap-all", action="store_true", default=True,
-                        help="全件SHAPを計算する（デフォルト: True）")
-    parser.add_argument("--shap-anomaly-only", action="store_true", default=False,
-                        help="異常レコードのみSHAP計算する（--shap-all を上書き）")
+    parser.add_argument("--shap-all", action=argparse.BooleanOptionalAction, default=True,
+                        help="全件SHAP計算。--no-shap-all で異常レコードのみに切り替え")
 
     # --- PCA ---
     parser.add_argument("--pca-variance-warning", type=float, default=0.50,
@@ -880,7 +878,7 @@ def main() -> None:
         ohe_coverage_threshold=args.ohe_coverage_threshold,
         variance_threshold=args.variance_threshold,
         corr_threshold=args.corr_threshold,
-        shap_all=not args.shap_anomaly_only,
+        shap_all=args.shap_all,
         pca_variance_warning=args.pca_variance_warning,
     )
 
