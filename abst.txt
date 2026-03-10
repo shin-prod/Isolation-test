@@ -1,0 +1,27 @@
+# 異常検知システム
+
+## 概要
+カテゴリ変数・数値変数が混在するCSVデータを入力し、
+Isolation Forestによる異常検知・SHAPによる原因分析・PCAによる2次元可視化を行うシステム。
+結果はTableau連携用CSVとして出力する。
+
+## 主要技術
+- 異常検知: Isolation Forest (scikit-learn)
+- 原因分析: SHAP (TreeExplainer)
+- 可視化データ生成: PCA 2次元圧縮
+- 前処理: 自動型判定・欠損補完・Label Encoding・頻度エンコーディング・日付分解
+
+## 入出力
+- 入力: in/ フォルダのCSVファイル（複数可、UTF-8/Shift-JIS自動判定）
+- 出力: out/ フォルダ
+  - result.csv         : 元データ + 異常スコア・フラグ・SHAP由来情報
+  - shap_summary.csv   : レコード × 特徴量のSHAP値マトリクス
+  - pca_2d.csv         : PC1/PC2座標 + 異常情報 + 元データ全列（Tableau用）
+  - pca_variance.csv   : 各主成分の寄与率
+  - excluded_columns.txt: 前処理で除外されたカラム一覧
+  - processing.log     : 処理ログ
+
+## 実行方法
+1. in/ フォルダに処理対象CSVを配置
+2. python main.py を実行
+3. out/ フォルダの結果CSVをTableauで開く

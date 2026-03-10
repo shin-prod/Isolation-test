@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.pyc
+.DS_Store
+data/
+*.log
+out/
+in/*.csv
+
+# 仮想環境（.envで指定したパスに合わせて追記）
+.venv/
+venv/
+env/
