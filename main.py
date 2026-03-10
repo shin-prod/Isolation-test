@@ -51,7 +51,7 @@ class Config:
     random_state: int = 42
 
     # --- 前処理 ---
-    missing_rate_threshold: float = 0.50    # 欠損率除外閾値
+    missing_rate_threshold: float = 0.80    # 欠損率除外閾値
     date_parse_threshold: float = 0.80      # 日付判定の成功率閾値
     ohe_top_n: int = 10                     # OHE対象とする上位カテゴリ数
     ohe_coverage_threshold: float = 0.50    # 上位N件のカバレッジ閾値（超えたらOHE）
@@ -232,7 +232,7 @@ def load_csvs(cfg: Config) -> pd.DataFrame:
 
 def _encode_column(
     df: pd.DataFrame, col: str, n_rows: int, cfg: Config
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, dict]:
     """単一の object 型カラムを型判定してエンコードする。
 
     優先順位:
@@ -250,8 +250,17 @@ def _encode_column(
         cfg: 実行設定
 
     Returns:
-        エンコード処理後のDataFrame
+        (エンコード処理後のDataFrame, エンコードサマリ dict)
     """
+    summary: dict = {
+        "column": col,
+        "encoding": "",
+        "n_unique": int(df[col].nunique()),
+        "coverage_top_n": None,
+        "other_count": None,
+        "generated_columns": "",
+    }
+
     # ---- 日付判定 ----
     parsed = pd.to_datetime(df[col], errors="coerce")
     parse_rate = parsed.notna().sum() / n_rows
@@ -270,12 +279,16 @@ def _encode_column(
             "hour": df[col].dt.hour,
             "weekday": df[col].dt.weekday,
         }
+        generated = []
         for part, values in date_parts.items():
             new_col = f"{col}_{part}"
             df[new_col] = values
+            generated.append(new_col)
             logger.debug(f"    生成: {new_col}")
         df = df.drop(columns=[col])
-        return df
+        summary["encoding"] = "datetime"
+        summary["generated_columns"] = ", ".join(generated)
+        return df, summary
 
     # ---- 欠損補完（最頻値）----
     n_null = int(df[col].isnull().sum())
@@ -295,6 +308,8 @@ def _encode_column(
     )
     logger.debug(f"  top{cfg.ohe_top_n} カテゴリ: {top_n_cats}")
 
+    summary["coverage_top_n"] = round(coverage, 4)
+
     if coverage >= cfg.ohe_coverage_threshold:
         # 上位N件以外を "__other__" に置き換えてから OHE
         other_count = int((~df[col].isin(top_n_cats)).sum())
@@ -307,6 +322,9 @@ def _encode_column(
             f"→ {len(dummies.columns)}列生成"
         )
         logger.debug(f"  生成列: {dummies.columns.tolist()}")
+        summary["encoding"] = "ohe"
+        summary["other_count"] = other_count
+        summary["generated_columns"] = ", ".join(dummies.columns.tolist())
     else:
         # 高カーディナリティ → 頻度エンコーディング
         df[col] = df[col].map(freq)
@@ -315,12 +333,16 @@ def _encode_column(
             f"(coverage={coverage:.3f} < {cfg.ohe_coverage_threshold})"
         )
         logger.debug(f"  頻度 top5:\n{freq.head().to_string()}")
+        summary["encoding"] = "frequency"
+        summary["generated_columns"] = col
 
-    return df
+    return df, summary
 
 
 @timed("前処理")
-def preprocess(df: pd.DataFrame, cfg: Config) -> tuple[pd.DataFrame, list[str]]:
+def preprocess(
+    df: pd.DataFrame, cfg: Config
+) -> tuple[pd.DataFrame, list[str], list[dict]]:
     """自動型判定・欠損補完・エンコーディングを行う前処理。
 
     Args:
@@ -328,9 +350,10 @@ def preprocess(df: pd.DataFrame, cfg: Config) -> tuple[pd.DataFrame, list[str]]:
         cfg: 実行設定
 
     Returns:
-        (処理済みDataFrame, 除外カラムリスト)
+        (処理済みDataFrame, 除外カラムリスト, カテゴリエンコードサマリリスト)
     """
     excluded_cols: list[str] = []
+    encode_summaries: list[dict] = []
     n_rows = len(df)
     logger.debug(f"前処理開始: {df.shape}")
 
@@ -378,7 +401,8 @@ def preprocess(df: pd.DataFrame, cfg: Config) -> tuple[pd.DataFrame, list[str]]:
                 )
 
         elif dtype == object:
-            df = _encode_column(df, col, n_rows, cfg)
+            df, enc_summary = _encode_column(df, col, n_rows, cfg)
+            encode_summaries.append(enc_summary)
 
         else:
             logger.debug(f"  未知dtype({dtype}) → 数値変換試行: {col}")
@@ -403,10 +427,11 @@ def preprocess(df: pd.DataFrame, cfg: Config) -> tuple[pd.DataFrame, list[str]]:
 
     logger.info(
         f"前処理後: {len(df.columns)}カラム "
-        f"(除外済み累計: {len(excluded_cols)}件)"
+        f"(除外済み累計: {len(excluded_cols)}件, "
+        f"カテゴリ処理: {len(encode_summaries)}件)"
     )
     _log_df_summary(df, "前処理後")
-    return df, excluded_cols
+    return df, excluded_cols, encode_summaries
 
 
 # ============================================================
@@ -708,6 +733,7 @@ def save_outputs(
     original_df: pd.DataFrame,
     results: ModelResults,
     excluded_cols: list[str],
+    encode_summaries: list[dict],
     cfg: Config,
 ) -> None:
     """結果ファイル一式を out/ フォルダに保存する。
@@ -716,6 +742,7 @@ def save_outputs(
         original_df: 元の入力DataFrame（変換前）
         results: モデリング結果
         excluded_cols: 前処理・特徴量選択で除外したカラム名リスト
+        encode_summaries: カテゴリ変数のエンコードサマリ
         cfg: 実行設定
     """
     cfg.out_dir.mkdir(exist_ok=True)
@@ -776,6 +803,19 @@ def save_outputs(
     logger.info(f"出力: excluded_columns.txt ({len(excluded_cols)}件)")
     logger.debug(f"除外カラム一覧: {excluded_cols}")
 
+    # ---- encoding_summary.csv ----
+    if encode_summaries:
+        enc_df = pd.DataFrame(encode_summaries, columns=[
+            "column", "encoding", "n_unique",
+            "coverage_top_n", "other_count", "generated_columns",
+        ])
+        out_path = cfg.out_dir / "encoding_summary.csv"
+        enc_df.to_csv(out_path, index=False, encoding="utf-8-sig")
+        logger.info(f"出力: encoding_summary.csv ({len(enc_df)}件)")
+        logger.debug(f"\n{enc_df.to_string(index=False)}")
+    else:
+        logger.info("カテゴリ変数なし: encoding_summary.csv はスキップ")
+
 
 # ============================================================
 # メイン処理
@@ -802,7 +842,7 @@ def main() -> None:
         original_df = load_csvs(cfg)
 
         # 2. 前処理
-        processed_df, excluded_cols = preprocess(original_df.copy(), cfg)
+        processed_df, excluded_cols, encode_summaries = preprocess(original_df.copy(), cfg)
         if processed_df.shape[1] == 0:
             raise AnomalyDetectionError("前処理後に有効なカラムが0件です。")
 
@@ -862,7 +902,7 @@ def main() -> None:
             pca_coords=pca_coords,
             pca_variance=pca_variance,
         )
-        save_outputs(original_df, results, excluded_cols, cfg)
+        save_outputs(original_df, results, excluded_cols, encode_summaries, cfg)
 
     except AnomalyDetectionError as e:
         logger.error(f"処理中断: {e}")
