@@ -59,7 +59,7 @@ class Config:
     corr_threshold: float = 0.95            # 高相関除外閾値
 
     # --- SHAP ---
-    shap_all: bool = False                  # True: 全件 / False: 異常レコードのみ
+    shap_all: bool = True                   # True: 全件 / False: 異常レコードのみ
 
     # --- PCA ---
     pca_variance_warning: float = 0.50      # 累積寄与率の警告閾値
@@ -592,8 +592,12 @@ def run_shap(
             logger.debug("shap_values が list 形式 → [0] を使用")
             shap_values = shap_values[0]
 
+        # score_samples ベースの SHAP を反転
+        # → 正の値が異常方向への寄与、負の値が正常方向への寄与
+        shap_values = -shap_values
+
         logger.debug(
-            f"SHAP値行列: shape={shap_values.shape}, "
+            f"SHAP値行列（反転後）: shape={shap_values.shape}, "
             f"min={shap_values.min():.4f}, max={shap_values.max():.4f}, "
             f"mean|SHAP|={np.abs(shap_values).mean():.4f}"
         )
@@ -723,7 +727,7 @@ def save_outputs(
     result_df["top_feature"] = results.top_feature_arr
     result_df["top_shap_value"] = results.top_shap_value_arr
     out_path = cfg.out_dir / "result.csv"
-    result_df.to_csv(out_path, index=False, encoding="utf-8-sig")
+    result_df.to_csv(out_path, index=True, index_label="index", encoding="utf-8-sig")
     logger.info(
         f"出力: result.csv ({len(result_df)}件, {len(result_df.columns)}カラム)"
     )
