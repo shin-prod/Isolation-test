@@ -60,7 +60,7 @@ class Config:
     corr_threshold: float = 0.95            # 高相関除外閾値
 
     # --- SHAP ---
-    shap_all: bool = True                   # True: 全件 / False: 異常レコードのみ
+    shap_all: bool = False                  # True: 全件 / False: 異常レコードのみ
 
     # --- PCA ---
     pca_variance_warning: float = 0.50      # 累積寄与率の警告閾値
@@ -877,7 +877,7 @@ def _parse_args() -> argparse.Namespace:
                         help="相関係数がこの値を超えるペアの片方を除外")
 
     # --- SHAP ---
-    parser.add_argument("--shap-all", action=argparse.BooleanOptionalAction, default=True,
+    parser.add_argument("--shap-all", action=argparse.BooleanOptionalAction, default=False,
                         help="全件SHAP計算。--no-shap-all で異常レコードのみに切り替え")
 
     # --- PCA ---
