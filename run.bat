@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 > nul
-setlocal
+setlocal enabledelayedexpansion
 
 rem --------------------------------------------------------
 rem .env から設定を読み込む
@@ -11,7 +11,9 @@ if exist .env (
     for /f "usebackq tokens=1,* delims==" %%A in (".env") do (
         set "line=%%A"
         if not "!line:~0,1!"=="#" (
-            set "%%A=%%B"
+            if not "!line!"=="" (
+                set "%%A=%%B"
+            )
         )
     )
 )
