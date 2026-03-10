@@ -377,9 +377,32 @@ def preprocess(
 
     # ---- カラムごとに型判定・処理 ----
     cols_to_process = list(df.columns)
-    logger.debug(
-        f"型判定対象カラム ({len(cols_to_process)}件): {cols_to_process}"
+
+    # dtype別に分類してINFOで表示
+    dtype_groups: dict[str, list[str]] = {"numeric": [], "object": [], "bool": [], "other": []}
+    for col in cols_to_process:
+        dtype = df[col].dtype
+        if dtype == bool:
+            dtype_groups["bool"].append(col)
+        elif pd.api.types.is_numeric_dtype(dtype):
+            dtype_groups["numeric"].append(col)
+        elif dtype == object:
+            dtype_groups["object"].append(col)
+        else:
+            dtype_groups["other"].append(col)
+
+    logger.info(
+        f"dtype別カラム数: 数値={len(dtype_groups['numeric'])}, "
+        f"カテゴリ(object)={len(dtype_groups['object'])}, "
+        f"bool={len(dtype_groups['bool'])}, "
+        f"その他={len(dtype_groups['other'])}"
     )
+    if dtype_groups["object"]:
+        logger.info(f"カテゴリカラム一覧: {dtype_groups['object']}")
+    else:
+        logger.warning("カテゴリカラム(object型)が検出されませんでした。"
+                       "CSVの文字列カラムが数値として読み込まれている可能性があります。")
+    logger.debug(f"型判定対象カラム ({len(cols_to_process)}件): {cols_to_process}")
 
     for col in cols_to_process:
         if col not in df.columns:
