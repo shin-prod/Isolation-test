@@ -793,9 +793,28 @@ def main() -> None:
         if feature_df.shape[1] == 0:
             raise AnomalyDetectionError("特徴量選択後に有効なカラムが0件です。")
 
-        # 4. 標準化
+        # 4. 標準化前の NaN 最終チェック・補完
+        nan_counts = feature_df.isnull().sum()
+        nan_cols = nan_counts[nan_counts > 0]
+        if not nan_cols.empty:
+            logger.warning(
+                f"標準化前に NaN を検出。中央値で補完します:\n{nan_cols.to_string()}"
+            )
+            feature_df = feature_df.fillna(feature_df.median())
+
+        # 標準化
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(feature_df.values)
+
+        # 標準化後の NaN チェック（無限大・数値異常も検出）
+        if not np.isfinite(X_scaled).all():
+            n_nan = int(np.isnan(X_scaled).sum())
+            n_inf = int(np.isinf(X_scaled).sum())
+            logger.warning(
+                f"標準化後に非有限値を検出 (NaN={n_nan}, Inf={n_inf})。0 で補完します。"
+            )
+            X_scaled = np.nan_to_num(X_scaled, nan=0.0, posinf=0.0, neginf=0.0)
+
         logger.info(f"標準化完了: shape={X_scaled.shape}")
         logger.debug(
             f"標準化後行列: mean={X_scaled.mean():.6f}, std={X_scaled.std():.6f}"
