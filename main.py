@@ -780,7 +780,7 @@ def save_outputs(
     for col in original_df.columns:
         pca_df[col] = original_df[col].values
     out_path = cfg.out_dir / "pca_2d.csv"
-    pca_df.to_csv(out_path, index=False, encoding="utf-8-sig")
+    pca_df.to_csv(out_path, index=True, index_label="index", encoding="utf-8-sig")
     logger.info(f"出力: pca_2d.csv ({len(pca_df)}件, {len(pca_df.columns)}カラム)")
     logger.debug(f"  → {out_path.resolve()}")
 
