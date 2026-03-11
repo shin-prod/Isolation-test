@@ -432,8 +432,8 @@ def preprocess(
         logger.info(f"【カラム設定JSON】定義数={len(column_config)}件")
         for col, spec in column_config.items():
             use = spec.get("use", True)
-            ctype = spec.get("type", "-")
-            enc = spec.get("encoding", "-")
+            ctype = str(spec.get("type", "-"))
+            enc = str(spec.get("encoding", "-"))
             top_n = str(spec.get("ohe_top_n", "-"))
             in_data = "✓" if col in data_cols else "✗(データになし)"
             flag = "ON " if use else "OFF"
