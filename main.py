@@ -434,7 +434,7 @@ def preprocess(
             use = spec.get("use", True)
             ctype = spec.get("type", "-")
             enc = spec.get("encoding", "-")
-            top_n = spec.get("ohe_top_n", "-")
+            top_n = str(spec.get("ohe_top_n", "-"))
             in_data = "✓" if col in data_cols else "✗(データになし)"
             flag = "ON " if use else "OFF"
             logger.info(
