@@ -431,16 +431,20 @@ def preprocess(
         logger.info("-" * 50)
         logger.info(f"【カラム設定JSON】定義数={len(column_config)}件")
         for col, spec in column_config.items():
-            use = spec.get("use", True)
-            ctype = str(spec.get("type", "-"))
-            enc = str(spec.get("encoding", "-"))
-            top_n = str(spec.get("ohe_top_n", "-"))
-            in_data = "✓" if col in data_cols else "✗(データになし)"
-            flag = "ON " if use else "OFF"
-            logger.info(
-                f"  [{flag}] {col:<30s} type={ctype:<12s} encoding={enc:<10s} "
-                f"ohe_top_n={top_n:<5s} data={in_data}",
-            )
+            try:
+                use = spec.get("use", True)
+                ctype = spec.get("type", "-")
+                enc = spec.get("encoding", "-")
+                top_n = spec.get("ohe_top_n", "-")
+                in_data = "✓" if col in data_cols else "✗(データになし)"
+                flag = "ON " if use else "OFF"
+                # :<N は s なしで int/str 両対応
+                logger.info(
+                    f"  [{flag}] {str(col):<30} type={str(ctype):<12} "
+                    f"encoding={str(enc):<10} ohe_top_n={str(top_n):<5} data={in_data}"
+                )
+            except Exception as e:
+                logger.warning(f"  カラム '{col}' のログ出力でエラー: {e} / spec={spec}")
 
         # データに存在するカラムとJSONのマッピングサマリ
         active_in_data  = [c for c in enabled_cols if c in data_cols]
