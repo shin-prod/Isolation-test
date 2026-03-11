@@ -3,8 +3,13 @@
 
   "age":         {"use": true,  "type": "numeric"},
   "created_at":  {"use": true,  "type": "date"},
+
   "region":      {"use": true,  "type": "categorical", "encoding": "ohe",       "ohe_top_n": 5},
   "category":    {"use": true,  "type": "categorical", "encoding": "ohe",       "ohe_top_n": 10},
   "description": {"use": true,  "type": "categorical", "encoding": "frequency"},
+
+  "status":      {"use": true,  "type": "categorical", "encoding": "auto",
+                  "ohe_top_n": 10, "ohe_coverage_threshold": 0.7},
+
   "customer_id": {"use": false, "type": "categorical", "encoding": "frequency"}
 }

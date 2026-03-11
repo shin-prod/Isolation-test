@@ -237,26 +237,27 @@ def _encode_column(
     col: str,
     n_rows: int,
     cfg: Config,
-    forced_encoding: Optional[str] = None,   # "ohe" | "frequency" | None（自動判定）
-    forced_ohe_top_n: Optional[int] = None,  # OHEの上位N件（None=cfg.ohe_top_nを使用）
+    forced_encoding: Optional[str] = None,              # "ohe" | "frequency" | "auto" | None
+    forced_ohe_top_n: Optional[int] = None,             # カラム個別の上位N件
+    forced_ohe_coverage_threshold: Optional[float] = None,  # カラム個別のカバレッジ閾値
 ) -> tuple[pd.DataFrame, dict]:
     """単一の object 型カラムを型判定してエンコードする。
 
-    forced_encoding が指定された場合はカバレッジ判定をスキップして強制適用。
-    forced_ohe_top_n が指定された場合はカラム個別の上位N件でOHEする。
-
-    優先順位（forced_encoding=None の場合）:
-      1. 日付パース成功率 >= date_parse_threshold → datetime 分解
-      2. 上位 ohe_top_n カバレッジ >= ohe_coverage_threshold → OHE
-      3. それ以外 → 頻度エンコーディング
+    encoding の優先順位:
+      "ohe"       : カバレッジに関わらず強制OHE
+      "frequency" : カバレッジに関わらず強制頻度エンコーディング
+      "auto"      : top_n のカバレッジ >= threshold なら OHE、未満なら頻度
+                    （日付判定はスキップ）
+      None        : 日付 → OHE/頻度の自動判定（グローバル設定を使用）
 
     Args:
         df: 処理対象DataFrame
         col: 対象カラム名
         n_rows: 全レコード数
         cfg: 実行設定
-        forced_encoding: 強制エンコーディング方式（"ohe" / "frequency" / None）
+        forced_encoding: エンコーディング方式（"ohe" / "frequency" / "auto" / None）
         forced_ohe_top_n: OHEの上位カテゴリ数（Noneの場合cfg.ohe_top_nを使用）
+        forced_ohe_coverage_threshold: カバレッジ閾値（Noneの場合cfg.ohe_coverage_thresholdを使用）
 
     Returns:
         (エンコード処理後のDataFrame, エンコードサマリ dict)
@@ -270,7 +271,7 @@ def _encode_column(
         "generated_columns": "",
     }
 
-    # ---- 日付判定（forced_encoding 未指定時のみ）----
+    # ---- 日付判定（forced_encoding 未指定時のみ / "auto" はスキップ）----
     if forced_encoding is None:
         parsed = pd.to_datetime(df[col], errors="coerce")
         parse_rate = parsed.notna().sum() / n_rows
@@ -310,13 +311,18 @@ def _encode_column(
 
     # ---- OHE / 頻度エンコーディング の決定 ----
     top_n = forced_ohe_top_n if forced_ohe_top_n is not None else cfg.ohe_top_n
+    threshold = (
+        forced_ohe_coverage_threshold
+        if forced_ohe_coverage_threshold is not None
+        else cfg.ohe_coverage_threshold
+    )
     freq = df[col].value_counts(normalize=True)
     top_n_cats = freq.nlargest(top_n).index.tolist()
     coverage = float(freq.nlargest(top_n).sum())
 
     logger.debug(
         f"  カバレッジ [{col}]: top{top_n}={coverage:.3f} "
-        f"(閾値={cfg.ohe_coverage_threshold}), unique={df[col].nunique()}, "
+        f"(閾値={threshold}), unique={df[col].nunique()}, "
         f"forced_encoding={forced_encoding}"
     )
     logger.debug(f"  top{top_n} カテゴリ: {top_n_cats}")
@@ -325,7 +331,7 @@ def _encode_column(
 
     use_ohe = (
         forced_encoding == "ohe"
-        or (forced_encoding is None and coverage >= cfg.ohe_coverage_threshold)
+        or (forced_encoding in (None, "auto") and coverage >= threshold)
     )
 
     if use_ohe:
@@ -334,9 +340,14 @@ def _encode_column(
         dummies = pd.get_dummies(df[col], prefix=col, dtype=int)
         df = df.drop(columns=[col])
         df = pd.concat([df, dummies], axis=1)
-        forced_label = f" [強制OHE top{top_n}]" if forced_encoding == "ohe" else ""
+        if forced_encoding == "ohe":
+            mode_label = f"強制OHE top{top_n}"
+        elif forced_encoding == "auto":
+            mode_label = f"自動→OHE top{top_n} (coverage={coverage:.3f}>={threshold:.3f})"
+        else:
+            mode_label = f"自動→OHE top{top_n}"
         logger.info(
-            f"  OHE{forced_label} [{col}]: top{top_n}カテゴリ "
+            f"  [{mode_label}] [{col}]: "
             f"(coverage={coverage:.3f}) "
             f"+ __other__({other_count}件) → {len(dummies.columns)}列生成"
         )
@@ -346,11 +357,13 @@ def _encode_column(
         summary["generated_columns"] = ", ".join(dummies.columns.tolist())
     else:
         df[col] = df[col].map(freq)
-        forced_label = " [強制頻度]" if forced_encoding == "frequency" else ""
-        logger.info(
-            f"  頻度エンコード{forced_label}: {col} "
-            f"(coverage={coverage:.3f})"
-        )
+        if forced_encoding == "frequency":
+            mode_label = "強制頻度"
+        elif forced_encoding == "auto":
+            mode_label = f"自動→頻度 (coverage={coverage:.3f}<{threshold:.3f})"
+        else:
+            mode_label = "自動→頻度"
+        logger.info(f"  [{mode_label}] {col} (coverage={coverage:.3f})")
         logger.debug(f"  頻度 top5:\n{freq.head().to_string()}")
         summary["encoding"] = "frequency"
         summary["generated_columns"] = col
@@ -532,12 +545,14 @@ def preprocess(
 
         dtype = df[col].dtype
         spec = column_config.get(col, {})
-        forced_type = spec.get("type")           # "numeric" | "date" | "categorical" | None
-        forced_enc  = spec.get("encoding")       # "ohe" | "frequency" | None
-        forced_topn = spec.get("ohe_top_n")      # int | None
+        forced_type      = spec.get("type")                    # "numeric" | "date" | "categorical" | None
+        forced_enc       = spec.get("encoding")               # "ohe" | "frequency" | "auto" | None
+        forced_topn      = spec.get("ohe_top_n")              # int | None
+        forced_threshold = spec.get("ohe_coverage_threshold") # float | None
         logger.debug(
             f"カラム処理: {col} (dtype={dtype}, "
-            f"forced_type={forced_type}, forced_enc={forced_enc}, forced_topn={forced_topn})"
+            f"forced_type={forced_type}, forced_enc={forced_enc}, "
+            f"forced_topn={forced_topn}, forced_threshold={forced_threshold})"
         )
 
         # JSON で type=numeric が指定された場合は強制数値変換
@@ -574,6 +589,7 @@ def preprocess(
                 df, col, n_rows, cfg,
                 forced_encoding=forced_enc,
                 forced_ohe_top_n=forced_topn,
+                forced_ohe_coverage_threshold=forced_threshold,
             )
             encode_summaries.append(enc_summary)
 
