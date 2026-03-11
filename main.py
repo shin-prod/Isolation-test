@@ -415,22 +415,52 @@ def preprocess(
     if cfg.column_config_path is not None:
         column_config = _load_column_config(cfg.column_config_path)
 
-        # use=false のカラムを除外
+        data_cols = set(df.columns)
+        enabled_cols = [c for c, s in column_config.items() if s.get("use", True)]
         disabled_cols = [c for c, s in column_config.items() if not s.get("use", True)]
+
+        # JSON定義カラムの一覧をINFOで表示
+        logger.info("-" * 50)
+        logger.info(f"【カラム設定JSON】定義数={len(column_config)}件")
+        for col, spec in column_config.items():
+            use = spec.get("use", True)
+            ctype = spec.get("type", "-")
+            enc = spec.get("encoding", "-")
+            top_n = spec.get("ohe_top_n", "-")
+            in_data = "✓" if col in data_cols else "✗(データになし)"
+            flag = "ON " if use else "OFF"
+            logger.info(
+                f"  [{flag}] {col:<30s} type={ctype:<12s} encoding={enc:<10s} "
+                f"ohe_top_n={top_n:<5s} data={in_data}",
+            )
+
+        # データに存在するカラムとJSONのマッピングサマリ
+        active_in_data  = [c for c in enabled_cols if c in data_cols]
+        missing_in_data = [c for c in enabled_cols if c not in data_cols]
+        unlisted        = [c for c in df.columns if c not in set(enabled_cols + disabled_cols)]
+
+        logger.info("-" * 50)
+        logger.info(f"【使用カラム（use=true かつデータに存在）】 {len(active_in_data)}件: {active_in_data}")
         if disabled_cols:
-            logger.info(f"use=false のため除外: {disabled_cols}")
-            excluded_cols.extend([c for c in disabled_cols if c in df.columns])
-            df = df.drop(columns=[c for c in disabled_cols if c in df.columns])
+            disabled_in_data = [c for c in disabled_cols if c in data_cols]
+            logger.info(f"【除外カラム（use=false）】 {len(disabled_in_data)}件: {disabled_in_data}")
+        if missing_in_data:
+            logger.warning(f"【JSONに定義されているがデータに存在しないカラム】 {len(missing_in_data)}件: {missing_in_data}")
+        if unlisted:
+            logger.info(f"【JSON未定義のため除外】 {len(unlisted)}件: {unlisted}")
+        logger.info("-" * 50)
+
+        # use=false のカラムを除外
+        if disabled_cols:
+            excluded_cols.extend([c for c in disabled_cols if c in data_cols])
+            df = df.drop(columns=[c for c in disabled_cols if c in data_cols])
 
         # JSON に記載のないカラムを除外
-        enabled_cols = [c for c, s in column_config.items() if s.get("use", True)]
-        unlisted = [c for c in df.columns if c not in enabled_cols]
         if unlisted:
-            logger.info(f"column_config 未定義のため除外: {unlisted}")
             excluded_cols.extend(unlisted)
             df = df.drop(columns=unlisted)
 
-        logger.info(f"column_config 適用後: {df.columns.tolist()}")
+        logger.info(f"column_config 適用後の使用カラム ({len(df.columns)}件): {df.columns.tolist()}")
 
     # ---- 欠損率チェック ----
     missing_ratio = df.isnull().mean()
