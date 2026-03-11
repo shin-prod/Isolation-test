@@ -2,12 +2,14 @@
 """
 重複削除スクリプト
 
---sum-cols で指定したカラムを合算対象とし、
-残りのカラムが全て一致するレコードを重複とみなして1レコードにまとめる。
+カラムを3種類に分類して重複集約する。
+
+  --sum-cols    : 数値カラム。重複グループ内で合算する。
+  --ignore-cols : 無視カラム（文字列想定）。重複判定に使わず max を取る。
+  残り          : キーカラム。これら全てが一致するレコードを重複とみなす。
 
 使い方:
-    python dedup.py --sum-cols 支払金額合計 税額 消費税額
-    python dedup.py --sum-cols 支払金額合計 --in-dir in --out-dir out
+    python dedup.py --sum-cols 支払金額合計 税額 --ignore-cols 備考 更新日時
 """
 
 import argparse
@@ -32,36 +34,47 @@ def load_csvs(in_dir: Path) -> pd.DataFrame:
     return combined
 
 
-def dedup(df: pd.DataFrame, sum_cols: list[str]) -> pd.DataFrame:
-    # 指定カラムの存在確認
-    missing = [c for c in sum_cols if c not in df.columns]
-    if missing:
-        raise SystemExit(f"[エラー] 指定した合計カラムがデータに存在しません: {missing}")
+def dedup(
+    df: pd.DataFrame,
+    sum_cols: list[str],
+    ignore_cols: list[str],
+) -> pd.DataFrame:
+    # 存在確認
+    for label, cols in [("--sum-cols", sum_cols), ("--ignore-cols", ignore_cols)]:
+        missing = [c for c in cols if c not in df.columns]
+        if missing:
+            raise SystemExit(f"[エラー] {label} に存在しないカラムが指定されています: {missing}")
 
-    key_cols = [c for c in df.columns if c not in sum_cols]
+    # 重複判定に使うキーカラム（sum / ignore 以外）
+    excluded = set(sum_cols) | set(ignore_cols)
+    key_cols = [c for c in df.columns if c not in excluded]
 
-    print(f"キーカラム（重複判定に使用） {len(key_cols)}件: {key_cols}")
-    print(f"合計カラム                  {len(sum_cols)}件: {sum_cols}")
+    print(f"キーカラム（重複判定）  {len(key_cols):3d}件: {key_cols}")
+    print(f"合計カラム（sum）       {len(sum_cols):3d}件: {sum_cols}")
+    print(f"無視カラム（max）       {len(ignore_cols):3d}件: {ignore_cols}")
 
     if not key_cols:
-        raise SystemExit("[エラー] キーカラムが0件です。全カラムを --sum-cols に指定しないでください。")
+        raise SystemExit("[エラー] キーカラムが0件です。")
 
     n_before = len(df)
 
-    if not sum_cols:
-        result = df.drop_duplicates().reset_index(drop=True)
-    else:
-        agg = {col: "sum" for col in sum_cols}
+    agg = {col: "sum" for col in sum_cols}
+    agg.update({col: "max" for col in ignore_cols})
+
+    if agg:
         result = (
             df.groupby(key_cols, dropna=False, sort=False)
             .agg(agg)
             .reset_index()
         )
-        result = result[df.columns]
+        result = result[df.columns]  # 元のカラム順に戻す
+    else:
+        result = df.drop_duplicates(subset=key_cols).reset_index(drop=True)
 
     n_removed = n_before - len(result)
     print(f"\n削除件数: {n_removed:,}件  ({n_before:,} → {len(result):,}件)")
 
+    # 合計カラムの合計値チェック
     if sum_cols:
         print("\n【合計カラムの合計値チェック（前後一致するはず）】")
         for col in sum_cols:
@@ -80,16 +93,17 @@ def main() -> None:
     )
     parser.add_argument("--in-dir",  type=Path, default=Path("in"),  help="入力CSVフォルダ")
     parser.add_argument("--out-dir", type=Path, default=Path("out"), help="出力フォルダ")
-    parser.add_argument("--sum-cols", nargs="*", default=[],
-                        metavar="カラム名",
-                        help="重複時に合算するカラム名（スペース区切りで複数指定）")
+    parser.add_argument("--sum-cols", nargs="*", default=[], metavar="カラム名",
+                        help="重複時に合算するカラム名（数値）")
+    parser.add_argument("--ignore-cols", nargs="*", default=[], metavar="カラム名",
+                        help="重複判定に使わず max を取るカラム名（文字列想定）")
     args = parser.parse_args()
 
     if not args.in_dir.exists():
         raise SystemExit(f"[エラー] 入力フォルダ '{args.in_dir}' が存在しません。")
 
     df = load_csvs(args.in_dir)
-    result = dedup(df, args.sum_cols)
+    result = dedup(df, args.sum_cols, args.ignore_cols)
 
     args.out_dir.mkdir(exist_ok=True)
     out_path = args.out_dir / "dedup.csv"
