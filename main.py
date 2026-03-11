@@ -68,6 +68,7 @@ class Config:
     # --- パス ---
     in_dir: Path = field(default_factory=lambda: Path("in"))
     out_dir: Path = field(default_factory=lambda: Path("out"))
+    column_config_path: Optional[Path] = None   # カラム設定JSONのパス
 
 
 # ============================================================
@@ -232,23 +233,30 @@ def load_csvs(cfg: Config) -> pd.DataFrame:
 # ============================================================
 
 def _encode_column(
-    df: pd.DataFrame, col: str, n_rows: int, cfg: Config
+    df: pd.DataFrame,
+    col: str,
+    n_rows: int,
+    cfg: Config,
+    forced_encoding: Optional[str] = None,   # "ohe" | "frequency" | None（自動判定）
+    forced_ohe_top_n: Optional[int] = None,  # OHEの上位N件（None=cfg.ohe_top_nを使用）
 ) -> tuple[pd.DataFrame, dict]:
     """単一の object 型カラムを型判定してエンコードする。
 
-    優先順位:
-      1. 日付パース成功率 >= date_parse_threshold
-             → datetime 分解（年/月/日/時/曜日）
-      2. 上位 ohe_top_n カテゴリのカバレッジ >= ohe_coverage_threshold
-             → 上位 N カテゴリを One-Hot Encoding、残りを "__other__"
-      3. それ以外（高カーディナリティ）
-             → 頻度エンコーディング
+    forced_encoding が指定された場合はカバレッジ判定をスキップして強制適用。
+    forced_ohe_top_n が指定された場合はカラム個別の上位N件でOHEする。
+
+    優先順位（forced_encoding=None の場合）:
+      1. 日付パース成功率 >= date_parse_threshold → datetime 分解
+      2. 上位 ohe_top_n カバレッジ >= ohe_coverage_threshold → OHE
+      3. それ以外 → 頻度エンコーディング
 
     Args:
         df: 処理対象DataFrame
         col: 対象カラム名
         n_rows: 全レコード数
         cfg: 実行設定
+        forced_encoding: 強制エンコーディング方式（"ohe" / "frequency" / None）
+        forced_ohe_top_n: OHEの上位カテゴリ数（Noneの場合cfg.ohe_top_nを使用）
 
     Returns:
         (エンコード処理後のDataFrame, エンコードサマリ dict)
@@ -262,34 +270,35 @@ def _encode_column(
         "generated_columns": "",
     }
 
-    # ---- 日付判定 ----
-    parsed = pd.to_datetime(df[col], errors="coerce")
-    parse_rate = parsed.notna().sum() / n_rows
-    logger.debug(
-        f"  日付パース率 [{col}]: {parse_rate:.3f} "
-        f"(閾値={cfg.date_parse_threshold})"
-    )
+    # ---- 日付判定（forced_encoding 未指定時のみ）----
+    if forced_encoding is None:
+        parsed = pd.to_datetime(df[col], errors="coerce")
+        parse_rate = parsed.notna().sum() / n_rows
+        logger.debug(
+            f"  日付パース率 [{col}]: {parse_rate:.3f} "
+            f"(閾値={cfg.date_parse_threshold})"
+        )
 
-    if parse_rate >= cfg.date_parse_threshold:
-        logger.info(f"  日付カラム → datetime分解: {col} (パース率={parse_rate:.3f})")
-        df[col] = parsed
-        date_parts = {
-            "year": df[col].dt.year,
-            "month": df[col].dt.month,
-            "day": df[col].dt.day,
-            "hour": df[col].dt.hour,
-            "weekday": df[col].dt.weekday,
-        }
-        generated = []
-        for part, values in date_parts.items():
-            new_col = f"{col}_{part}"
-            df[new_col] = values
-            generated.append(new_col)
-            logger.debug(f"    生成: {new_col}")
-        df = df.drop(columns=[col])
-        summary["encoding"] = "datetime"
-        summary["generated_columns"] = ", ".join(generated)
-        return df, summary
+        if parse_rate >= cfg.date_parse_threshold:
+            logger.info(f"  日付カラム → datetime分解: {col} (パース率={parse_rate:.3f})")
+            df[col] = parsed
+            date_parts = {
+                "year": df[col].dt.year,
+                "month": df[col].dt.month,
+                "day": df[col].dt.day,
+                "hour": df[col].dt.hour,
+                "weekday": df[col].dt.weekday,
+            }
+            generated = []
+            for part, values in date_parts.items():
+                new_col = f"{col}_{part}"
+                df[new_col] = values
+                generated.append(new_col)
+                logger.debug(f"    生成: {new_col}")
+            df = df.drop(columns=[col])
+            summary["encoding"] = "datetime"
+            summary["generated_columns"] = ", ".join(generated)
+            return df, summary
 
     # ---- 欠損補完（最頻値）----
     n_null = int(df[col].isnull().sum())
@@ -299,45 +308,88 @@ def _encode_column(
         df[col] = df[col].fillna(fill_val)
         logger.debug(f"  欠損補完 [{col}]: {n_null}件 → '{fill_val}'")
 
-    # ---- カバレッジ判定 ----
+    # ---- OHE / 頻度エンコーディング の決定 ----
+    top_n = forced_ohe_top_n if forced_ohe_top_n is not None else cfg.ohe_top_n
     freq = df[col].value_counts(normalize=True)
-    top_n_cats = freq.nlargest(cfg.ohe_top_n).index.tolist()
-    coverage = float(freq.nlargest(cfg.ohe_top_n).sum())
+    top_n_cats = freq.nlargest(top_n).index.tolist()
+    coverage = float(freq.nlargest(top_n).sum())
+
     logger.debug(
-        f"  カバレッジ [{col}]: top{cfg.ohe_top_n}={coverage:.3f} "
-        f"(閾値={cfg.ohe_coverage_threshold}), unique={df[col].nunique()}"
+        f"  カバレッジ [{col}]: top{top_n}={coverage:.3f} "
+        f"(閾値={cfg.ohe_coverage_threshold}), unique={df[col].nunique()}, "
+        f"forced_encoding={forced_encoding}"
     )
-    logger.debug(f"  top{cfg.ohe_top_n} カテゴリ: {top_n_cats}")
+    logger.debug(f"  top{top_n} カテゴリ: {top_n_cats}")
 
     summary["coverage_top_n"] = round(coverage, 4)
 
-    if coverage >= cfg.ohe_coverage_threshold:
-        # 上位N件以外を "__other__" に置き換えてから OHE
+    use_ohe = (
+        forced_encoding == "ohe"
+        or (forced_encoding is None and coverage >= cfg.ohe_coverage_threshold)
+    )
+
+    if use_ohe:
         other_count = int((~df[col].isin(top_n_cats)).sum())
         df[col] = df[col].where(df[col].isin(top_n_cats), other="__other__")
         dummies = pd.get_dummies(df[col], prefix=col, dtype=int)
         df = df.drop(columns=[col])
         df = pd.concat([df, dummies], axis=1)
+        forced_label = f" [強制OHE top{top_n}]" if forced_encoding == "ohe" else ""
         logger.info(
-            f"  OHE [{col}]: top{cfg.ohe_top_n}カテゴリ + __other__({other_count}件) "
-            f"→ {len(dummies.columns)}列生成"
+            f"  OHE{forced_label} [{col}]: top{top_n}カテゴリ "
+            f"+ __other__({other_count}件) → {len(dummies.columns)}列生成"
         )
         logger.debug(f"  生成列: {dummies.columns.tolist()}")
         summary["encoding"] = "ohe"
         summary["other_count"] = other_count
         summary["generated_columns"] = ", ".join(dummies.columns.tolist())
     else:
-        # 高カーディナリティ → 頻度エンコーディング
         df[col] = df[col].map(freq)
+        forced_label = " [強制頻度]" if forced_encoding == "frequency" else ""
         logger.info(
-            f"  高カーディナリティ → 頻度エンコード: {col} "
-            f"(coverage={coverage:.3f} < {cfg.ohe_coverage_threshold})"
+            f"  頻度エンコード{forced_label}: {col} "
+            f"(coverage={coverage:.3f})"
         )
         logger.debug(f"  頻度 top5:\n{freq.head().to_string()}")
         summary["encoding"] = "frequency"
         summary["generated_columns"] = col
 
     return df, summary
+
+
+def _load_column_config(path: Path) -> dict:
+    """カラム設定JSONを読み込む。
+
+    フォーマット例:
+    {
+      "age":         {"use": true,  "type": "numeric"},
+      "region":      {"use": true,  "type": "categorical", "encoding": "ohe", "ohe_top_n": 5},
+      "customer_id": {"use": false, "type": "categorical", "encoding": "frequency"}
+    }
+
+    Args:
+        path: JSONファイルのパス
+
+    Returns:
+        カラム名 → 設定dict のマッピング
+
+    Raises:
+        AnomalyDetectionError: ファイルが存在しない / JSON形式エラー
+    """
+    import json
+
+    if not path.exists():
+        raise AnomalyDetectionError(f"カラム設定ファイルが見つかりません: {path}")
+    try:
+        with open(path, encoding="utf-8") as f:
+            config = json.load(f)
+    except json.JSONDecodeError as e:
+        raise AnomalyDetectionError(f"カラム設定JSONの解析エラー: {e}") from e
+
+    logger.info(f"カラム設定JSON読み込み: {path} ({len(config)}カラム定義)")
+    for col, spec in config.items():
+        logger.debug(f"  {col}: {spec}")
+    return config
 
 
 @timed("前処理")
@@ -357,6 +409,28 @@ def preprocess(
     encode_summaries: list[dict] = []
     n_rows = len(df)
     logger.debug(f"前処理開始: {df.shape}")
+
+    # ---- カラム設定JSON の適用 ----
+    column_config: dict = {}
+    if cfg.column_config_path is not None:
+        column_config = _load_column_config(cfg.column_config_path)
+
+        # use=false のカラムを除外
+        disabled_cols = [c for c, s in column_config.items() if not s.get("use", True)]
+        if disabled_cols:
+            logger.info(f"use=false のため除外: {disabled_cols}")
+            excluded_cols.extend([c for c in disabled_cols if c in df.columns])
+            df = df.drop(columns=[c for c in disabled_cols if c in df.columns])
+
+        # JSON に記載のないカラムを除外
+        enabled_cols = [c for c, s in column_config.items() if s.get("use", True)]
+        unlisted = [c for c in df.columns if c not in enabled_cols]
+        if unlisted:
+            logger.info(f"column_config 未定義のため除外: {unlisted}")
+            excluded_cols.extend(unlisted)
+            df = df.drop(columns=unlisted)
+
+        logger.info(f"column_config 適用後: {df.columns.tolist()}")
 
     # ---- 欠損率チェック ----
     missing_ratio = df.isnull().mean()
@@ -409,9 +483,53 @@ def preprocess(
             continue  # 日付分解で削除済み
 
         dtype = df[col].dtype
-        logger.debug(f"カラム処理: {col} (dtype={dtype})")
+        spec = column_config.get(col, {})
+        forced_type = spec.get("type")           # "numeric" | "date" | "categorical" | None
+        forced_enc  = spec.get("encoding")       # "ohe" | "frequency" | None
+        forced_topn = spec.get("ohe_top_n")      # int | None
+        logger.debug(
+            f"カラム処理: {col} (dtype={dtype}, "
+            f"forced_type={forced_type}, forced_enc={forced_enc}, forced_topn={forced_topn})"
+        )
 
-        if dtype == bool:
+        # JSON で type=numeric が指定された場合は強制数値変換
+        if forced_type == "numeric":
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+            df[col] = df[col].fillna(df[col].median())
+            logger.debug(f"  [JSON] numeric 強制変換: {col}")
+
+        # JSON で type=date が指定された場合は強制日付分解
+        elif forced_type == "date":
+            parsed = pd.to_datetime(df[col], errors="coerce")
+            df[col] = parsed
+            date_parts = {
+                "year": df[col].dt.year, "month": df[col].dt.month,
+                "day": df[col].dt.day, "hour": df[col].dt.hour,
+                "weekday": df[col].dt.weekday,
+            }
+            generated = []
+            for part, values in date_parts.items():
+                new_col = f"{col}_{part}"
+                df[new_col] = values
+                generated.append(new_col)
+            df = df.drop(columns=[col])
+            encode_summaries.append({
+                "column": col, "encoding": "datetime",
+                "n_unique": None, "coverage_top_n": None,
+                "other_count": None, "generated_columns": ", ".join(generated),
+            })
+            logger.info(f"  [JSON] date 強制分解: {col} → {generated}")
+
+        # JSON で type=categorical が指定、または dtype==object の場合
+        elif forced_type == "categorical" or (forced_type is None and dtype == object):
+            df, enc_summary = _encode_column(
+                df, col, n_rows, cfg,
+                forced_encoding=forced_enc,
+                forced_ohe_top_n=forced_topn,
+            )
+            encode_summaries.append(enc_summary)
+
+        elif dtype == bool:
             df[col] = df[col].astype(int)
             logger.debug(f"  bool → int: {col}")
 
@@ -423,10 +541,6 @@ def preprocess(
                 logger.debug(
                     f"  数値欠損補完 [{col}]: {n_null}件 → 中央値={median_val:.4g}"
                 )
-
-        elif dtype == object:
-            df, enc_summary = _encode_column(df, col, n_rows, cfg)
-            encode_summaries.append(enc_summary)
 
         else:
             logger.debug(f"  未知dtype({dtype}) → 数値変換試行: {col}")
@@ -884,6 +998,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--pca-variance-warning", type=float, default=0.50,
                         help="PCA累積寄与率がこの値を下回ると警告")
 
+    # --- カラム設定 ---
+    parser.add_argument("--column-config", type=Path, default=None,
+                        help="カラム設定JSONファイルのパス (例: column_config.json)")
+
     return parser.parse_args()
 
 
@@ -903,6 +1021,7 @@ def main() -> None:
         corr_threshold=args.corr_threshold,
         shap_all=args.shap_all,
         pca_variance_warning=args.pca_variance_warning,
+        column_config_path=args.column_config,
     )
 
     setup_logging(cfg.out_dir)

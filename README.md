@@ -164,25 +164,61 @@ python main.py
 
 ## パラメータ設定
 
-`main.py` の `Config` クラスで調整できます。
+主要パラメータはコマンドライン引数で指定できます。
 
-```python
-@dataclass(frozen=True)
-class Config:
-    contamination: float = 0.05      # 異常割合の想定値（0.0〜0.5）
-    n_estimators: int = 200          # 木の本数（多いほど安定・低速）
-    max_features: float = 1.0        # 各木で使用する特徴量の割合
-    random_state: int = 42           # 乱数シード（再現性）
-
-    missing_rate_threshold: float = 0.50   # 欠損率除外閾値
-    date_parse_threshold: float = 0.80     # 日付判定の成功率閾値
-    high_cardinality_threshold: float = 0.50  # 高カーディナリティ判定閾値
-    variance_threshold: float = 0.01       # 低分散除外閾値
-    corr_threshold: float = 0.95           # 高相関除外閾値
-
-    shap_all: bool = False           # True: 全件SHAP計算 / False: 異常レコードのみ
-    pca_variance_warning: float = 0.50     # PCA累積寄与率の警告閾値
+```bash
+python main.py \
+  --contamination 0.05 \
+  --n-estimators 200 \
+  --missing-rate-threshold 0.80 \
+  --ohe-top-n 10 \
+  --ohe-coverage-threshold 0.50 \
+  --variance-threshold 0.01 \
+  --corr-threshold 0.95 \
+  --shap-all \           # 全件SHAP（デフォルト: 異常レコードのみ）
+  --pca-variance-warning 0.50 \
+  --column-config column_config.json   # カラム設定JSON（省略可）
 ```
+
+| 引数 | デフォルト | 説明 |
+|------|-----------|------|
+| `--contamination` | 0.05 | 異常割合の想定値（0.0〜0.5） |
+| `--n-estimators` | 200 | 木の本数（多いほど安定・低速） |
+| `--missing-rate-threshold` | 0.80 | 欠損率がこの値を超えるカラムを除外 |
+| `--ohe-top-n` | 10 | OHE対象とする上位カテゴリ数 |
+| `--ohe-coverage-threshold` | 0.50 | 上位N件のカバレッジがこの値以上ならOHE |
+| `--variance-threshold` | 0.01 | 分散がこの値未満のカラムを除外 |
+| `--corr-threshold` | 0.95 | 相関係数がこの値を超えるペアの片方を除外 |
+| `--shap-all` / `--no-shap-all` | False | 全件SHAP / 異常レコードのみ |
+| `--pca-variance-warning` | 0.50 | PCA累積寄与率の警告閾値 |
+| `--column-config` | なし | カラム設定JSONファイルのパス |
+
+---
+
+## カラム設定JSON（オプション）
+
+`--column-config` にJSONファイルを指定すると、カラムごとに型・エンコーディング方法を明示指定できます。
+
+`column_config.example.json` をコピーして編集してください。
+
+```json
+{
+  "age":         {"use": true,  "type": "numeric"},
+  "created_at":  {"use": true,  "type": "date"},
+  "region":      {"use": true,  "type": "categorical", "encoding": "ohe",       "ohe_top_n": 5},
+  "description": {"use": true,  "type": "categorical", "encoding": "frequency"},
+  "customer_id": {"use": false, "type": "categorical", "encoding": "frequency"}
+}
+```
+
+| フィールド | 値 | 説明 |
+|-----------|-----|------|
+| `use` | `true` / `false` | `false` のカラムは処理から除外 |
+| `type` | `numeric` / `date` / `categorical` | 型を強制指定 |
+| `encoding` | `ohe` / `frequency` | カテゴリカル変数のエンコーディング方式 |
+| `ohe_top_n` | 整数 | OHE対象とする上位カテゴリ数（カラム個別設定） |
+
+> **注意**: JSONに記載されていないカラムはすべて除外されます。
 
 ---
 
