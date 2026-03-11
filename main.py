@@ -384,7 +384,15 @@ def _load_column_config(path: Path) -> dict:
         with open(path, encoding="utf-8") as f:
             config = json.load(f)
     except json.JSONDecodeError as e:
-        raise AnomalyDetectionError(f"カラム設定JSONの解析エラー: {e}") from e
+        raise AnomalyDetectionError(
+            f"カラム設定JSONの構文エラー: {e}\n"
+            f"  ファイル: {path}"
+        ) from e
+    except OSError as e:
+        raise AnomalyDetectionError(
+            f"カラム設定JSONの読み込みエラー: {e}\n"
+            f"  ファイル: {path}"
+        ) from e
 
     logger.info(f"カラム設定JSON読み込み: {path} ({len(config)}カラム定義)")
     for col, spec in config.items():
@@ -445,7 +453,12 @@ def preprocess(
             disabled_in_data = [c for c in disabled_cols if c in data_cols]
             logger.info(f"【除外カラム（use=false）】 {len(disabled_in_data)}件: {disabled_in_data}")
         if missing_in_data:
-            logger.warning(f"【JSONに定義されているがデータに存在しないカラム】 {len(missing_in_data)}件: {missing_in_data}")
+            logger.error(f"【エラー】JSONでONに設定されているがデータに存在しないカラム: {missing_in_data}")
+            raise AnomalyDetectionError(
+                f"column_config に use=true で定義されているカラムがデータに存在しません: {missing_in_data}\n"
+                f"  JSONファイル: {cfg.column_config_path}\n"
+                f"  データのカラム一覧: {sorted(data_cols)}"
+            )
         if unlisted:
             logger.info(f"【JSON未定義のため除外】 {len(unlisted)}件: {unlisted}")
         logger.info("-" * 50)
