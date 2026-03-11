@@ -337,6 +337,7 @@ def _encode_column(
         forced_label = f" [強制OHE top{top_n}]" if forced_encoding == "ohe" else ""
         logger.info(
             f"  OHE{forced_label} [{col}]: top{top_n}カテゴリ "
+            f"(coverage={coverage:.3f}) "
             f"+ __other__({other_count}件) → {len(dummies.columns)}列生成"
         )
         logger.debug(f"  生成列: {dummies.columns.tolist()}")
