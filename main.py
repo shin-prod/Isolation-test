@@ -935,11 +935,15 @@ def tune_hyperparams(
         top_pct = trial.user_attrs.get("top_pct", float("nan"))
         is_best = val == study.best_value
         best_label = " ★best更新" if is_best else ""
-        # best更新時は構造パラメータ（重みを除く）のみ表示（ログが長くなりすぎないよう）
         params_str = ""
         if is_best:
             struct = {k: v for k, v in trial.params.items() if not k.startswith("w_")}
             params_str = "  (" + ", ".join(f"{k}={v:.4g}" for k, v in struct.items()) + ")"
+            # 重みチューニング有効時は値のみをリスト表示
+            if cfg.lof_tune_weights:
+                w_vals = [v for k, v in trial.params.items() if k.startswith("w_")]
+                if w_vals:
+                    params_str += "  w=[" + ", ".join(f"{w:.2f}" for w in w_vals) + "]"
         logger.info(
             f"  trial {n:>4d}/{cfg.n_trials}  score={val:.6f}"
             f"  上位{top_pct:.2f}%{best_label}{params_str}"
