@@ -6,13 +6,24 @@ in/ フォルダのCSVを読み込み、数値以外のカラムについて
 上位10件・上位20件のカバレッジ率を一覧表示する。
 """
 
+import argparse
 from pathlib import Path
 
 import pandas as pd
 
 
 def main() -> None:
-    in_dir = Path("in")
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--in-dir",  type=Path, default=Path("in"),  help="入力CSVフォルダ")
+    parser.add_argument("--out-dir", type=Path, default=Path("out"), help="出力フォルダ")
+    parser.add_argument("--encoding", type=str, default="cp932",
+                        help="入力CSVの文字コード (cp932=Shift-JIS, utf-8 など)")
+    args = parser.parse_args()
+
+    in_dir   = args.in_dir
+    out_dir  = args.out_dir
+    encoding = args.encoding
+
     if not in_dir.exists():
         print(f"[エラー] 入力フォルダ '{in_dir}' が存在しません。")
         return
@@ -24,7 +35,7 @@ def main() -> None:
 
     dfs = []
     for f in csv_files:
-        df = pd.read_csv(f, encoding="utf-8")
+        df = pd.read_csv(f, encoding=encoding)
         print(f"読み込み: {f.name}  {len(df)}件  {len(df.columns)}カラム")
         dfs.append(df)
 
@@ -62,8 +73,8 @@ def main() -> None:
     print(result.to_string(index=False))
 
     # CSV出力
-    out_path = Path("out/coverage_check.csv")
-    out_path.parent.mkdir(exist_ok=True)
+    out_path = out_dir / "coverage_check.csv"
+    out_dir.mkdir(exist_ok=True)
     result.to_csv(out_path, index=False, encoding="utf-8-sig")
     print(f"\n→ {out_path} に保存しました。")
 

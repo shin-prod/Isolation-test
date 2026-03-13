@@ -18,14 +18,14 @@ from pathlib import Path
 import pandas as pd
 
 
-def load_csvs(in_dir: Path) -> pd.DataFrame:
+def load_csvs(in_dir: Path, encoding: str = "cp932") -> pd.DataFrame:
     csv_files = sorted(in_dir.glob("*.csv"))
     if not csv_files:
         raise SystemExit(f"[エラー] '{in_dir}' にCSVファイルがありません。")
 
     dfs = []
     for f in csv_files:
-        df = pd.read_csv(f, encoding="utf-8")
+        df = pd.read_csv(f, encoding=encoding)
         print(f"読み込み: {f.name}  {len(df):,}件  {len(df.columns)}カラム")
         dfs.append(df)
 
@@ -93,6 +93,8 @@ def main() -> None:
     )
     parser.add_argument("--in-dir",  type=Path, default=Path("in"),  help="入力CSVフォルダ")
     parser.add_argument("--out-dir", type=Path, default=Path("out"), help="出力フォルダ")
+    parser.add_argument("--encoding", type=str, default="cp932",
+                        help="入力CSVの文字コード (cp932=Shift-JIS, utf-8 など)")
     parser.add_argument("--sum-cols", nargs="*", default=[], metavar="カラム名",
                         help="重複時に合算するカラム名（数値）")
     parser.add_argument("--ignore-cols", nargs="*", default=[], metavar="カラム名",
@@ -102,7 +104,7 @@ def main() -> None:
     if not args.in_dir.exists():
         raise SystemExit(f"[エラー] 入力フォルダ '{args.in_dir}' が存在しません。")
 
-    df = load_csvs(args.in_dir)
+    df = load_csvs(args.in_dir, args.encoding)
     result = dedup(df, args.sum_cols, args.ignore_cols)
 
     args.out_dir.mkdir(exist_ok=True)

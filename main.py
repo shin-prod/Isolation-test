@@ -52,6 +52,9 @@ class Config:
     max_samples: float = 1.0            # 各木で使うサンプルの割合
     random_state: int = 42
 
+    # --- 入力 ---
+    input_encoding: str = "cp932"           # 入力CSVの文字コード（Shift-JIS=cp932, UTF-8=utf-8）
+
     # --- 前処理 ---
     missing_rate_threshold: float = 0.80    # 欠損率除外閾値
     date_parse_threshold: float = 0.80      # 日付判定の成功率閾値
@@ -213,7 +216,7 @@ def load_csvs(cfg: Config) -> pd.DataFrame:
     dfs: list[pd.DataFrame] = []
     for csv_file in csv_files:
         try:
-            df = pd.read_csv(csv_file, encoding="utf-8")
+            df = pd.read_csv(csv_file, encoding=cfg.input_encoding)
         except Exception as e:
             raise AnomalyDetectionError(
                 f"CSV読み込みエラー ({csv_file.name}): {e}"
@@ -1160,6 +1163,8 @@ def _parse_args() -> argparse.Namespace:
                         help="入力CSVフォルダのパス")
     parser.add_argument("--out-dir", type=Path, default=Path("out"),
                         help="出力フォルダのパス")
+    parser.add_argument("--encoding", type=str, default="cp932",
+                        help="入力CSVの文字コード (cp932=Shift-JIS, utf-8 など)")
 
     # --- Isolation Forest ---
     parser.add_argument("--contamination", type=float, default=0.05,
@@ -1211,6 +1216,7 @@ def main() -> None:
     cfg = Config(
         in_dir=args.in_dir,
         out_dir=args.out_dir,
+        input_encoding=args.encoding,
         contamination=args.contamination,
         n_estimators=args.n_estimators,
         max_samples=args.max_samples,
