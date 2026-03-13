@@ -70,8 +70,9 @@ class Config:
     pca_variance_warning: float = 0.50      # 累積寄与率の警告閾値
 
     # --- Optunaチューニング ---
-    label_col: Optional[str] = None         # ラベル列名（指定時にチューニング実行）
+    label_col: Optional[str] = None         # ラベル列名（パーセンタイル表示・チューニングに使用）
     label_anomaly_value: int = 1            # 異常を示すラベル値
+    tune: bool = False                      # True: Optunaチューニングを実行
     n_trials: int = 100                     # Optunaの試行回数
 
     # --- パス ---
@@ -1252,9 +1253,11 @@ def _parse_args() -> argparse.Namespace:
 
     # --- Optunaチューニング ---
     parser.add_argument("--label-col", type=str, default=None,
-                        help="ラベル列名。指定するとOptunaチューニングを実行")
+                        help="ラベル列名（パーセンタイル表示・チューニングに使用）")
     parser.add_argument("--label-anomaly-value", type=int, default=1,
                         help="異常を示すラベル値")
+    parser.add_argument("--tune", action=argparse.BooleanOptionalAction, default=False,
+                        help="Optunaチューニングを実行（--label-col 必須）")
     parser.add_argument("--n-trials", type=int, default=100,
                         help="Optunaの試行回数")
 
@@ -1305,6 +1308,7 @@ def main() -> None:
         pca_variance_warning=args.pca_variance_warning,
         label_col=args.label_col,
         label_anomaly_value=args.label_anomaly_value,
+        tune=args.tune,
         n_trials=args.n_trials,
         column_config_path=args.column_config,
     )
@@ -1371,8 +1375,12 @@ def main() -> None:
         feature_names = feature_df.columns.tolist()
         logger.debug(f"特徴量名 ({len(feature_names)}件): {feature_names}")
 
-        # 5. Optunaチューニング（--label-col 指定時のみ）
-        if cfg.label_col is not None:
+        # 5. Optunaチューニング（--tune かつ --label-col 指定時のみ）
+        if cfg.tune:
+            if cfg.label_col is None:
+                raise AnomalyDetectionError(
+                    "--tune を使用するには --label-col でラベル列名を指定してください。"
+                )
             cfg = tune_hyperparams(X_scaled, original_df, cfg)
 
         # 6. Isolation Forest
