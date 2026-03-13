@@ -49,6 +49,7 @@ class Config:
     contamination: float = 0.05
     n_estimators: int = 200
     max_features: float = 1.0
+    max_samples: float = 1.0            # 各木で使うサンプルの割合
     random_state: int = 42
 
     # --- 前処理 ---
@@ -64,6 +65,11 @@ class Config:
 
     # --- PCA ---
     pca_variance_warning: float = 0.50      # 累積寄与率の警告閾値
+
+    # --- Optunaチューニング ---
+    label_col: Optional[str] = None         # ラベル列名（指定時にチューニング実行）
+    label_anomaly_value: int = 1            # 異常を示すラベル値
+    n_trials: int = 100                     # Optunaの試行回数
 
     # --- パス ---
     in_dir: Path = field(default_factory=lambda: Path("in"))
@@ -706,6 +712,123 @@ def select_features(
 
 
 # ============================================================
+# Optunaハイパーパラメータチューニング
+# ============================================================
+
+@timed("Optunaチューニング")
+def tune_hyperparams(
+    X_scaled: np.ndarray,
+    original_df: pd.DataFrame,
+    cfg: Config,
+) -> Config:
+    """Optunaでハイパーパラメータを探索し、最適なConfigを返す。
+
+    目的関数: ラベル付き異常レコードの anomaly_score 中央値を最大化。
+    探索対象: contamination / max_features / max_samples
+
+    Args:
+        X_scaled: 標準化済み特徴量行列
+        original_df: 元データ（ラベル列を含む）
+        cfg: 現在の設定
+
+    Returns:
+        best_params で上書きした新しい Config
+
+    Raises:
+        AnomalyDetectionError: ラベル列が存在しない / 異常レコードが0件
+    """
+    try:
+        import optuna
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+    except ImportError:
+        raise AnomalyDetectionError(
+            "optunaがインストールされていません。"
+            " pip install optuna を実行してください。"
+        )
+
+    if cfg.label_col not in original_df.columns:
+        raise AnomalyDetectionError(
+            f"ラベル列 '{cfg.label_col}' がデータに存在しません。"
+            f" データのカラム: {original_df.columns.tolist()}"
+        )
+
+    labeled_idx = np.where(
+        original_df[cfg.label_col].values == cfg.label_anomaly_value
+    )[0]
+    if len(labeled_idx) == 0:
+        raise AnomalyDetectionError(
+            f"ラベル列 '{cfg.label_col}' に異常値 '{cfg.label_anomaly_value}' が"
+            f" 1件も存在しません。"
+        )
+
+    logger.info(
+        f"チューニング開始: ラベル列={cfg.label_col}, "
+        f"異常値={cfg.label_anomaly_value}, "
+        f"ラベル付き異常件数={len(labeled_idx)}, "
+        f"試行回数={cfg.n_trials}"
+    )
+
+    def objective(trial: "optuna.Trial") -> float:
+        contamination = trial.suggest_float("contamination", 0.001, 0.10, log=True)
+        max_features  = trial.suggest_float("max_features",  0.3,   1.0)
+        max_samples   = trial.suggest_float("max_samples",   0.1,   1.0)
+
+        model = IsolationForest(
+            n_estimators=cfg.n_estimators,
+            contamination=contamination,
+            max_features=max_features,
+            max_samples=max_samples,
+            random_state=cfg.random_state,
+        )
+        model.fit(X_scaled)
+        scores = -model.score_samples(X_scaled)
+        return float(np.median(scores[labeled_idx]))
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=cfg.n_trials, show_progress_bar=False)
+
+    best = study.best_params
+    best_value = study.best_value
+    logger.info(
+        f"チューニング完了: best_value(中央値)={best_value:.6f}\n"
+        f"  contamination={best['contamination']:.6f}\n"
+        f"  max_features={best['max_features']:.4f}\n"
+        f"  max_samples={best['max_samples']:.4f}"
+    )
+
+    # チューニング結果をCSVに保存
+    trials_df = study.trials_dataframe()[
+        ["number", "value", "params_contamination", "params_max_features", "params_max_samples"]
+    ].sort_values("value", ascending=False)
+    out_path = cfg.out_dir / "tuning_results.csv"
+    trials_df.to_csv(out_path, index=False, encoding="utf-8-sig")
+    logger.info(f"出力: tuning_results.csv ({len(trials_df)}試行)")
+
+    # best_params を Config に反映して返す
+    return Config(
+        contamination=best["contamination"],
+        max_features=best["max_features"],
+        max_samples=best["max_samples"],
+        n_estimators=cfg.n_estimators,
+        random_state=cfg.random_state,
+        missing_rate_threshold=cfg.missing_rate_threshold,
+        date_parse_threshold=cfg.date_parse_threshold,
+        ohe_top_n=cfg.ohe_top_n,
+        ohe_coverage_threshold=cfg.ohe_coverage_threshold,
+        variance_threshold=cfg.variance_threshold,
+        corr_threshold=cfg.corr_threshold,
+        shap_all=cfg.shap_all,
+        pca_variance_warning=cfg.pca_variance_warning,
+        label_col=cfg.label_col,
+        label_anomaly_value=cfg.label_anomaly_value,
+        n_trials=cfg.n_trials,
+        in_dir=cfg.in_dir,
+        out_dir=cfg.out_dir,
+        column_config_path=cfg.column_config_path,
+    )
+
+
+# ============================================================
 # Isolation Forest
 # ============================================================
 
@@ -726,6 +849,7 @@ def run_isolation_forest(
         f"パラメータ: n_estimators={cfg.n_estimators}, "
         f"contamination={cfg.contamination}, "
         f"max_features={cfg.max_features}, "
+        f"max_samples={cfg.max_samples}, "
         f"random_state={cfg.random_state}"
     )
     logger.debug(f"入力行列: shape={X_scaled.shape}")
@@ -734,6 +858,7 @@ def run_isolation_forest(
         n_estimators=cfg.n_estimators,
         contamination=cfg.contamination,
         max_features=cfg.max_features,
+        max_samples=cfg.max_samples,
         random_state=cfg.random_state,
     )
     model.fit(X_scaled)
@@ -1041,6 +1166,16 @@ def _parse_args() -> argparse.Namespace:
                         help="異常割合の想定値 (0.0〜0.5)")
     parser.add_argument("--n-estimators", type=int, default=200,
                         help="Isolation Forestの木の本数")
+    parser.add_argument("--max-samples", type=float, default=1.0,
+                        help="各木で使うサンプルの割合 (0.0〜1.0)")
+
+    # --- Optunaチューニング ---
+    parser.add_argument("--label-col", type=str, default=None,
+                        help="ラベル列名。指定するとOptunaチューニングを実行")
+    parser.add_argument("--label-anomaly-value", type=int, default=1,
+                        help="異常を示すラベル値")
+    parser.add_argument("--n-trials", type=int, default=100,
+                        help="Optunaの試行回数")
 
     # --- 前処理 ---
     parser.add_argument("--missing-rate-threshold", type=float, default=0.80,
@@ -1078,6 +1213,7 @@ def main() -> None:
         out_dir=args.out_dir,
         contamination=args.contamination,
         n_estimators=args.n_estimators,
+        max_samples=args.max_samples,
         missing_rate_threshold=args.missing_rate_threshold,
         ohe_top_n=args.ohe_top_n,
         ohe_coverage_threshold=args.ohe_coverage_threshold,
@@ -1085,6 +1221,9 @@ def main() -> None:
         corr_threshold=args.corr_threshold,
         shap_all=args.shap_all,
         pca_variance_warning=args.pca_variance_warning,
+        label_col=args.label_col,
+        label_anomaly_value=args.label_anomaly_value,
+        n_trials=args.n_trials,
         column_config_path=args.column_config,
     )
 
@@ -1150,18 +1289,22 @@ def main() -> None:
         feature_names = feature_df.columns.tolist()
         logger.debug(f"特徴量名 ({len(feature_names)}件): {feature_names}")
 
-        # 5. Isolation Forest
+        # 5. Optunaチューニング（--label-col 指定時のみ）
+        if cfg.label_col is not None:
+            cfg = tune_hyperparams(X_scaled, original_df, cfg)
+
+        # 6. Isolation Forest
         model, anomaly_score, is_anomaly = run_isolation_forest(X_scaled, cfg)
 
-        # 6. SHAP
+        # 7. SHAP
         shap_df, top_feature_arr, top_shap_value_arr = run_shap(
             model, X_scaled, is_anomaly, feature_names, cfg
         )
 
-        # 7. PCA
+        # 8. PCA
         pca_coords, pca_variance = run_pca(X_scaled, cfg)
 
-        # 8. 出力
+        # 9. 出力
         results = ModelResults(
             anomaly_score=anomaly_score,
             is_anomaly=is_anomaly,
