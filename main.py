@@ -1413,6 +1413,15 @@ def main() -> None:
         )
         save_outputs(original_df, results, excluded_cols, encode_summaries, cfg)
 
+        # 最終サマリ：flag付きデータの異常スコア位置
+        if cfg.label_col is not None:
+            labeled_idx = np.where(
+                original_df[cfg.label_col].values == cfg.label_anomaly_value
+            )[0]
+            logger.info("=" * 60)
+            _log_labeled_percentile(anomaly_score, labeled_idx, "最終サマリ")
+            logger.info("=" * 60)
+
     except AnomalyDetectionError as e:
         logger.error(f"処理中断: {e}")
         sys.exit(1)
