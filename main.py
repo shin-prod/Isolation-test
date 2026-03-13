@@ -1701,6 +1701,15 @@ def save_outputs(
     # ---- result.csv ----
     result_df = original_df.copy()
     result_df["anomaly_score"] = results.anomaly_score
+
+    # 相対スコア: 最低=0.0, 最高=1.0, 中央値≒0.5（順位ベース正規化）
+    n_rec = len(results.anomaly_score)
+    if n_rec > 1:
+        ranks = pd.Series(results.anomaly_score).rank(method="average") - 1
+        result_df["anomaly_score_relative"] = (ranks / (n_rec - 1)).clip(0.0, 1.0).values
+    else:
+        result_df["anomaly_score_relative"] = np.zeros(n_rec)
+
     result_df["is_anomaly"] = results.is_anomaly
     result_df["top_feature"] = results.top_feature_arr
     result_df["top_shap_value"] = results.top_shap_value_arr
