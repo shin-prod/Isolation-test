@@ -282,7 +282,7 @@ def _encode_column(
     # ---- 先頭N文字への切り詰め ----
     if prefix_n is not None:
         n_unique_before = df[col].nunique()
-        df[col] = df[col].str[:prefix_n]
+        df[col] = df[col].astype(str).str[:prefix_n]
         n_unique_after = df[col].nunique()
         logger.info(
             f"  先頭{prefix_n}文字に切り詰め [{col}]: "
