@@ -710,11 +710,14 @@ def select_features(
         )
         logger.debug(f"  保護対象: {sorted(ohe_protected)}")
 
-    # ---- 分散フィルタ ----
+    # ---- 分散フィルタ（OHE列は保護）----
     variances = df.var()
     logger.debug(f"全カラムの分散（昇順）:\n{variances.sort_values().to_string()}")
 
-    low_var_cols = variances[variances < cfg.variance_threshold].index.tolist()
+    low_var_cols = [
+        col for col, var in variances.items()
+        if var < cfg.variance_threshold and col not in ohe_protected
+    ]
     if low_var_cols:
         for col in low_var_cols:
             logger.debug(
