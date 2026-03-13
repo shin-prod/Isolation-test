@@ -79,6 +79,7 @@ class Config:
     # --- モデル手法 ---
     method: str = "if"                      # "if": Isolation Forest / "lof": Local Outlier Factor
     lof_n_neighbors: int = 20               # LOFの近傍数
+    lof_tune_weights: bool = True           # LOF+Optuna時に特徴量重みをチューニングするか
 
     # --- パス ---
     in_dir: Path = field(default_factory=lambda: Path("in"))
@@ -896,11 +897,12 @@ def tune_hyperparams(
         def objective(trial: "optuna.Trial") -> float:
             n_neighbors   = trial.suggest_int("n_neighbors", 5, 50)
             contamination = trial.suggest_float("contamination", 0.001, 0.10, log=True)
-            # 元カラム単位で重みを探索（OHE展開前に決定）
-            for orig_col in column_groups:
-                trial.suggest_float(f"w_{orig_col}", 0.1, 3.0)
-            weights = _build_weight_array(trial.params)
-            X_weighted = X_scaled * weights
+            # 重みチューニングが有効な場合のみ元カラム単位で重みを探索
+            if cfg.lof_tune_weights:
+                for orig_col in column_groups:
+                    trial.suggest_float(f"w_{orig_col}", 0.1, 3.0)
+            weights = _build_weight_array(trial.params) if cfg.lof_tune_weights else None
+            X_weighted = X_scaled * weights if weights is not None else X_scaled
             model = LocalOutlierFactor(
                 n_neighbors=n_neighbors,
                 contamination=contamination,
@@ -1018,6 +1020,7 @@ def tune_hyperparams(
         n_trials=cfg.n_trials,
         method=cfg.method,
         lof_n_neighbors=cfg.lof_n_neighbors,
+        lof_tune_weights=cfg.lof_tune_weights,
         in_dir=cfg.in_dir,
         out_dir=cfg.out_dir,
         column_config_path=cfg.column_config_path,
@@ -1481,6 +1484,8 @@ def _parse_args() -> argparse.Namespace:
                         help="異常検知手法: if=Isolation Forest, lof=Local Outlier Factor")
     parser.add_argument("--lof-n-neighbors", type=int, default=20,
                         help="LOFの近傍数 (--method lof 時に使用)")
+    parser.add_argument("--lof-tune-weights", action=argparse.BooleanOptionalAction, default=True,
+                        help="LOF+Optuna時に特徴量重みをチューニングする。--no-lof-tune-weights で無効化")
 
     # --- カラム設定 ---
     parser.add_argument("--column-config", type=Path, default=None,
@@ -1513,6 +1518,7 @@ def main() -> None:
         n_trials=args.n_trials,
         method=args.method,
         lof_n_neighbors=args.lof_n_neighbors,
+        lof_tune_weights=args.lof_tune_weights,
         column_config_path=args.column_config,
     )
 
