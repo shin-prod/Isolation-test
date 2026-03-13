@@ -674,18 +674,40 @@ def preprocess(
 
 @timed("特徴量選択")
 def select_features(
-    df: pd.DataFrame, excluded_cols: list[str], cfg: Config
+    df: pd.DataFrame,
+    excluded_cols: list[str],
+    cfg: Config,
+    encode_summaries: list[dict],
 ) -> tuple[pd.DataFrame, list[str]]:
     """低分散・高相関カラムを除外する特徴量選択。
+
+    OHEで展開されたカラムは相関フィルタの除外対象から保護する。
+    OHEグループの一部だけが消えると元カラムの情報が欠落するため。
 
     Args:
         df: 前処理済みDataFrame
         excluded_cols: これまでの除外カラムリスト（破壊的に追記）
         cfg: 実行設定
+        encode_summaries: preprocess() が返すエンコードサマリ（OHE列特定に使用）
 
     Returns:
         (選択後DataFrame, 更新された除外カラムリスト)
     """
+    # OHEで生成されたカラム名のセットを構築（相関フィルタから保護）
+    ohe_protected: set[str] = set()
+    for s in encode_summaries:
+        if s.get("encoding") == "ohe":
+            for col in s.get("generated_columns", "").split(","):
+                col = col.strip()
+                if col and col in df.columns:
+                    ohe_protected.add(col)
+    if ohe_protected:
+        logger.info(
+            f"相関フィルタ保護（OHE列）: {len(ohe_protected)}件 "
+            f"— OHEグループの部分削除を防ぐため除外対象から除く"
+        )
+        logger.debug(f"  保護対象: {sorted(ohe_protected)}")
+
     # ---- 分散フィルタ ----
     variances = df.var()
     logger.debug(f"全カラムの分散（昇順）:\n{variances.sort_values().to_string()}")
@@ -722,8 +744,10 @@ def select_features(
         for col_a, col_b, r in sorted(high_corr_pairs, key=lambda x: -x[2]):
             logger.debug(f"  {col_a} ↔ {col_b}: {r:.4f}")
 
+    # OHE列は除外対象から保護
     high_corr_cols = [
-        col for col in upper.columns if any(upper[col] > cfg.corr_threshold)
+        col for col in upper.columns
+        if col not in ohe_protected and any(upper[col] > cfg.corr_threshold)
     ]
     if high_corr_cols:
         logger.info(
@@ -1561,7 +1585,9 @@ def main() -> None:
             raise AnomalyDetectionError("前処理後に有効なカラムが0件です。")
 
         # 3. 特徴量選択
-        feature_df, excluded_cols = select_features(processed_df, excluded_cols, cfg)
+        feature_df, excluded_cols = select_features(
+            processed_df, excluded_cols, cfg, encode_summaries
+        )
         if feature_df.shape[1] == 0:
             raise AnomalyDetectionError("特徴量選択後に有効なカラムが0件です。")
 
