@@ -32,6 +32,7 @@ from sklearn.decomposition import PCA
 from sklearn.ensemble import IsolationForest
 from sklearn.neighbors import LocalOutlierFactor
 from sklearn.preprocessing import StandardScaler
+from sklearn.utils.extmath import randomized_svd
 
 # ============================================================
 # モジュールレベルロガー（setup_logging() で初期化）
@@ -1294,10 +1295,14 @@ def run_shap(
     is_anomaly: np.ndarray,
     feature_names: list[str],
     cfg: Config,
+    shap_indices: Optional[np.ndarray] = None,
 ) -> tuple[Optional[pd.DataFrame], np.ndarray, np.ndarray]:
     """SHAP値を算出し、各レコードの最大寄与特徴量を特定する。
 
-    計算対象は cfg.shap_all=False の場合は is_anomaly=1 のレコードのみ。
+    計算対象の優先順位:
+      1. shap_indices が指定されていればそのインデックス（label_col==1 など）
+      2. cfg.shap_all=True なら全件
+      3. それ以外は is_anomaly=1 のレコードのみ
     LOFモデルの場合はSHAPをスキップする。
     エラー発生時は警告ログを出力しスキップ（result.csv は出力継続）。
 
@@ -1307,6 +1312,7 @@ def run_shap(
         is_anomaly: 異常フラグ配列
         feature_names: 特徴量名リスト
         cfg: 実行設定
+        shap_indices: 計算対象レコードのインデックス配列（None の場合は自動決定）
 
     Returns:
         (shap_df or None, top_feature_arr, top_shap_value_arr)
@@ -1327,6 +1333,9 @@ def run_shap(
         if cfg.shap_all:
             indices = np.arange(n)
             logger.info(f"SHAP: 全件計算 ({n}件)")
+        elif shap_indices is not None:
+            indices = shap_indices
+            logger.info(f"SHAP: ラベル付き異常レコードのみ計算 ({len(indices)} / {n}件)")
         else:
             indices = np.where(is_anomaly == 1)[0]
             logger.info(f"SHAP: 異常レコードのみ計算 ({len(indices)} / {n}件)")
@@ -1384,59 +1393,173 @@ def run_shap(
 
 
 # ============================================================
-# PCA
+# PCA / MCA
 # ============================================================
 
-@timed("PCA")
-def run_pca(X_scaled: np.ndarray, cfg: Config) -> tuple[np.ndarray, np.ndarray]:
-    """PCAで2次元に圧縮し、主成分座標と寄与率を返す。
+def _run_mca_first_component(X_ohe: np.ndarray) -> np.ndarray:
+    """OHEインジケータ行列に対応分析(MCA)を適用し、第1成分スコアを返す。
+
+    指示行列の対応分析（Correspondence Analysis）を利用。
+    各行は元カテゴリカラム数だけ 1 を持つ 0/1 行列を想定。
+
+    Args:
+        X_ohe: OHEインジケータ行列 (n×p)、値は 0 または 1
+
+    Returns:
+        第1成分の行スコア配列 (n,)
+    """
+    X = X_ohe.astype(float)
+    N = X.sum()
+    if N == 0:
+        return np.zeros(X.shape[0])
+
+    Z = X / N                                   # 比率行列
+    r = Z.sum(axis=1)                           # 行マス (n,)
+    c = Z.sum(axis=0)                           # 列マス (p,)
+
+    # ゼロ除算回避
+    r_inv_sqrt = np.where(r > 0, 1.0 / np.sqrt(r), 0.0)
+    c_inv_sqrt = np.where(c > 0, 1.0 / np.sqrt(c), 0.0)
+
+    # 残差行列（独立からの偏差をスケーリング）
+    S = r_inv_sqrt[:, np.newaxis] * (Z - np.outer(r, c)) * c_inv_sqrt[np.newaxis, :]
+
+    n_comp = min(2, min(S.shape) - 1)
+    if n_comp < 1:
+        return np.zeros(X.shape[0])
+
+    U, sigma, _ = randomized_svd(S, n_components=n_comp, random_state=42)
+
+    # 行座標（第1成分）
+    scores = r_inv_sqrt * U[:, 0] * sigma[0]
+    return scores
+
+
+@timed("PCA/MCA")
+def run_pca_mca(
+    X_scaled: np.ndarray,
+    feature_df: pd.DataFrame,
+    feature_names: list[str],
+    encode_summaries: list[dict],
+    cfg: Config,
+) -> tuple[np.ndarray, dict]:
+    """数値カラム→PCA第1軸、OHEカラム→MCA第1軸 のハイブリッド2次元座標を返す。
+
+    カラム種別ごとの処理:
+      - 数値 & OHE 両方あり: DIM1=PCA-PC1(数値), DIM2=MCA-DIM1(OHE)
+      - 数値のみ: 標準PCA 2成分
+      - OHEのみ: MCA 第1成分 + ゼロ埋め第2成分
+
+    MCA に使うカラムは特徴量選択を通過したものだけ（feature_names 内）。
 
     Args:
         X_scaled: 標準化済み特徴量行列
+        feature_df: 特徴量選択後の未スケールDataFrame（OHEの0/1値を取得するため）
+        feature_names: 前処理・特徴量選択後の特徴量名リスト
+        encode_summaries: preprocess() が返すエンコードサマリ
         cfg: 実行設定
 
     Returns:
-        (pca_coords [n×2], explained_variance_ratio)
+        (coords [n×2], dim_info dict)
+        dim_info には "dim1" / "dim2" キーで各軸の説明文字列を格納。
     """
-    n_components = min(2, X_scaled.shape[1])
-    logger.debug(
-        f"PCA: n_components={n_components}, input_shape={X_scaled.shape}"
-    )
+    # 特徴量選択後に残っているOHEカラムを特定
+    ohe_cols_in_features: set[str] = set()
+    for s in encode_summaries:
+        if s.get("encoding") == "ohe":
+            for col in s.get("generated_columns", "").split(","):
+                col = col.strip()
+                if col and col in feature_names:
+                    ohe_cols_in_features.add(col)
 
-    pca = PCA(n_components=n_components, random_state=cfg.random_state)
-    coords = pca.fit_transform(X_scaled)
+    numeric_col_list = [c for c in feature_names if c not in ohe_cols_in_features]
+    ohe_col_list     = [c for c in feature_names if c in ohe_cols_in_features]
 
-    variance_ratio = pca.explained_variance_ratio_
-    cumulative = float(np.sum(variance_ratio))
-    pc1_var = float(variance_ratio[0])
-    pc2_var = float(variance_ratio[1]) if n_components > 1 else 0.0
+    has_numeric = len(numeric_col_list) > 0
+    has_ohe     = len(ohe_col_list) > 0
 
     logger.info(
-        f"PCA寄与率: PC1={pc1_var:.3f} ({pc1_var*100:.1f}%), "
-        f"PC2={pc2_var:.3f} ({pc2_var*100:.1f}%), "
-        f"累積={cumulative:.3f} ({cumulative*100:.1f}%)"
+        f"PCA/MCA: 数値カラム={len(numeric_col_list)}件, "
+        f"OHEカラム={len(ohe_col_list)}件"
     )
-    logger.debug(f"固有値: {pca.explained_variance_.tolist()}")
+    logger.debug(f"  数値カラム: {numeric_col_list}")
+    logger.debug(f"  OHEカラム: {ohe_col_list}")
+
+    feat_idx = {f: i for i, f in enumerate(feature_names)}
+
+    if has_numeric and has_ohe:
+        # --- DIM1: 数値カラムのPCA第1成分 ---
+        num_indices = [feat_idx[c] for c in numeric_col_list]
+        X_num = X_scaled[:, num_indices]
+        pca = PCA(n_components=1, random_state=cfg.random_state)
+        axis1 = pca.fit_transform(X_num)[:, 0]
+        var1 = float(pca.explained_variance_ratio_[0])
+
+        # --- DIM2: OHEカラムのMCA第1成分（未スケール0/1値を使用）---
+        X_ohe = feature_df[ohe_col_list].values
+        axis2 = _run_mca_first_component(X_ohe)
+
+        coords = np.column_stack([axis1, axis2])
+        dim_info = {
+            "dim1": f"PCA-PC1 (数値 {len(numeric_col_list)}列, var={var1:.3f})",
+            "dim2": f"MCA-DIM1 (OHE {len(ohe_col_list)}列)",
+        }
+        logger.info(
+            f"DIM1=PCA-PC1 (数値 {len(numeric_col_list)}列, 寄与率={var1:.3f}), "
+            f"DIM2=MCA-DIM1 (OHE {len(ohe_col_list)}列)"
+        )
+
+    elif has_numeric:
+        # 数値カラムのみ → 標準PCA 2成分
+        num_indices = [feat_idx[c] for c in numeric_col_list]
+        X_num = X_scaled[:, num_indices]
+        n_comp = min(2, X_num.shape[1])
+        pca = PCA(n_components=n_comp, random_state=cfg.random_state)
+        raw = pca.fit_transform(X_num)
+        vr = pca.explained_variance_ratio_
+        cumulative = float(np.sum(vr))
+        if cumulative < cfg.pca_variance_warning:
+            logger.warning(
+                f"PCA累積寄与率 ({cumulative:.3f}) が "
+                f"警告閾値 ({cfg.pca_variance_warning}) を下回っています。"
+            )
+        if n_comp == 1:
+            raw = np.hstack([raw, np.zeros((len(raw), 1))])
+            vr = np.append(vr, 0.0)
+        coords = raw
+        dim_info = {
+            "dim1": f"PCA-PC1 (数値 {len(numeric_col_list)}列, var={vr[0]:.3f})",
+            "dim2": f"PCA-PC2 (数値 {len(numeric_col_list)}列, var={vr[1]:.3f})",
+        }
+        logger.info(
+            f"DIM1=PCA-PC1 (var={vr[0]:.3f}), DIM2=PCA-PC2 (var={vr[1]:.3f}), "
+            f"累積={cumulative:.3f}"
+        )
+
+    elif has_ohe:
+        # OHEカラムのみ → MCA 第1成分 + ゼロ埋め
+        X_ohe = feature_df[ohe_col_list].values
+        axis1 = _run_mca_first_component(X_ohe)
+        coords = np.column_stack([axis1, np.zeros(len(axis1))])
+        dim_info = {
+            "dim1": f"MCA-DIM1 (OHE {len(ohe_col_list)}列)",
+            "dim2": "zeros (OHEのみのためMCA第2成分省略)",
+        }
+        logger.info(f"DIM1=MCA-DIM1 (OHE {len(ohe_col_list)}列), DIM2=zeros")
+
+    else:
+        coords = np.zeros((X_scaled.shape[0], 2))
+        dim_info = {"dim1": "zeros", "dim2": "zeros"}
+        logger.warning("PCA/MCA: 有効なカラムがありません。ゼロ座標を使用します。")
+
     logger.debug(
-        f"PC1スコア範囲: [{coords[:, 0].min():.4f}, {coords[:, 0].max():.4f}]"
+        f"DIM1スコア範囲: [{coords[:, 0].min():.4f}, {coords[:, 0].max():.4f}]"
     )
-    if n_components > 1:
-        logger.debug(
-            f"PC2スコア範囲: [{coords[:, 1].min():.4f}, {coords[:, 1].max():.4f}]"
-        )
+    logger.debug(
+        f"DIM2スコア範囲: [{coords[:, 1].min():.4f}, {coords[:, 1].max():.4f}]"
+    )
 
-    if cumulative < cfg.pca_variance_warning:
-        logger.warning(
-            f"PCA累積寄与率 ({cumulative:.3f}) が "
-            f"警告閾値 ({cfg.pca_variance_warning}) を下回っています。"
-        )
-
-    # 常に2列確保（特徴量が1次元しかない場合）
-    if n_components == 1:
-        coords = np.hstack([coords, np.zeros((len(coords), 1))])
-        variance_ratio = np.append(variance_ratio, 0.0)
-
-    return coords, variance_ratio
+    return coords, dim_info
 
 
 # ============================================================
@@ -1452,7 +1575,7 @@ class ModelResults:
     top_feature_arr: np.ndarray
     top_shap_value_arr: np.ndarray
     pca_coords: np.ndarray
-    pca_variance: np.ndarray
+    pca_dim_info: dict          # DIM1/DIM2 の説明（PCA寄与率 or MCA軸情報）
 
 
 @timed("結果出力")
@@ -1496,10 +1619,10 @@ def save_outputs(
     else:
         logger.info("SHAP出力スキップ")
 
-    # ---- pca_2d.csv（PC1, PC2, 異常情報, 元データ全列）----
+    # ---- pca_2d.csv（DIM1, DIM2, 異常情報, 元データ全列）----
     pca_df = pd.DataFrame({
-        "PC1": results.pca_coords[:, 0],
-        "PC2": results.pca_coords[:, 1],
+        "DIM1": results.pca_coords[:, 0],
+        "DIM2": results.pca_coords[:, 1],
         "anomaly_score": results.anomaly_score,
         "is_anomaly": results.is_anomaly,
         "top_feature": results.top_feature_arr,
@@ -1511,16 +1634,14 @@ def save_outputs(
     logger.info(f"出力: pca_2d.csv ({len(pca_df)}件, {len(pca_df.columns)}カラム)")
     logger.debug(f"  → {out_path.resolve()}")
 
-    # ---- pca_variance.csv ----
-    n_comp = len(results.pca_variance)
-    variance_df = pd.DataFrame({
-        "component": [f"PC{i + 1}" for i in range(n_comp)],
-        "explained_variance_ratio": results.pca_variance,
-        "cumulative_variance_ratio": np.cumsum(results.pca_variance),
-    })
-    out_path = cfg.out_dir / "pca_variance.csv"
-    variance_df.to_csv(out_path, index=False, encoding="utf-8-sig")
-    logger.info("出力: pca_variance.csv")
+    # ---- dim_info.csv（各次元の説明）----
+    dim_df = pd.DataFrame([
+        {"dimension": "DIM1", "description": results.pca_dim_info.get("dim1", "")},
+        {"dimension": "DIM2", "description": results.pca_dim_info.get("dim2", "")},
+    ])
+    out_path = cfg.out_dir / "dim_info.csv"
+    dim_df.to_csv(out_path, index=False, encoding="utf-8-sig")
+    logger.info("出力: dim_info.csv")
 
     # ---- excluded_columns.txt ----
     content = "\n".join(excluded_cols) if excluded_cols else "(除外カラムなし)"
@@ -1751,13 +1872,22 @@ def main() -> None:
             )[0]
             _log_labeled_percentile(anomaly_score, labeled_idx, "最終モデル")
 
-        # 7. SHAP
+        # 7. SHAP（デフォルトは label_col==label_anomaly_value のレコード）
+        if not cfg.shap_all and cfg.label_col is not None:
+            shap_indices = np.where(
+                original_df[cfg.label_col].values == cfg.label_anomaly_value
+            )[0]
+        else:
+            shap_indices = None
         shap_df, top_feature_arr, top_shap_value_arr = run_shap(
-            model, X_scaled, is_anomaly, feature_names, cfg
+            model, X_scaled, is_anomaly, feature_names, cfg,
+            shap_indices=shap_indices,
         )
 
-        # 8. PCA
-        pca_coords, pca_variance = run_pca(X_scaled, cfg)
+        # 8. PCA/MCA ハイブリッド（数値軸=PCA, OHE軸=MCA）
+        pca_coords, pca_dim_info = run_pca_mca(
+            X_scaled, feature_df, feature_names, encode_summaries, cfg
+        )
 
         # 9. 出力
         results = ModelResults(
@@ -1767,7 +1897,7 @@ def main() -> None:
             top_feature_arr=top_feature_arr,
             top_shap_value_arr=top_shap_value_arr,
             pca_coords=pca_coords,
-            pca_variance=pca_variance,
+            pca_dim_info=pca_dim_info,
         )
         save_outputs(original_df, results, excluded_cols, encode_summaries, cfg)
 
