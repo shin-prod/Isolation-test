@@ -818,8 +818,25 @@ def tune_hyperparams(
         scores = -model.score_samples(X_scaled)
         return float(np.median(scores[labeled_idx]))
 
+    best_so_far: list[float] = []  # ミュータブルなセルとしてコールバックで参照
+
+    def _log_callback(study: "optuna.Study", trial: "optuna.Trial") -> None:
+        n = trial.number + 1
+        val = trial.value if trial.value is not None else float("nan")
+        is_best = val == study.best_value
+        # 10試行ごと or ベスト更新時にINFO出力
+        if is_best or n % 10 == 0 or n == cfg.n_trials:
+            best_label = " ★best更新" if is_best else ""
+            logger.info(
+                f"  trial {n:>4d}/{cfg.n_trials}  score={val:.6f}{best_label}"
+                + (f"  (contamination={trial.params['contamination']:.5f}"
+                   f", max_features={trial.params['max_features']:.3f}"
+                   f", max_samples={trial.params['max_samples']:.3f})"
+                   if is_best else "")
+            )
+
     study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=cfg.n_trials, show_progress_bar=False)
+    study.optimize(objective, n_trials=cfg.n_trials, callbacks=[_log_callback])
 
     best = study.best_params
     best_value = study.best_value
