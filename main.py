@@ -824,6 +824,11 @@ def tune_hyperparams(
         f"試行回数={cfg.n_trials}"
     )
 
+    def _calc_top_pct(scores: np.ndarray) -> float:
+        """ラベル付き異常の中央値スコアが全体の上位何%かを返す。"""
+        median_score = float(np.median(scores[labeled_idx]))
+        return 100.0 - float((scores < median_score).mean() * 100)
+
     if cfg.method == "lof":
         def objective(trial: "optuna.Trial") -> float:
             n_neighbors   = trial.suggest_int("n_neighbors", 5, 50)
@@ -835,6 +840,7 @@ def tune_hyperparams(
             )
             model.fit_predict(X_scaled)
             scores = -model.negative_outlier_factor_
+            trial.set_user_attr("top_pct", _calc_top_pct(scores))
             return float(np.median(scores[labeled_idx]))
     else:
         def objective(trial: "optuna.Trial") -> float:
@@ -850,11 +856,13 @@ def tune_hyperparams(
             )
             model.fit(X_scaled)
             scores = -model.score_samples(X_scaled)
+            trial.set_user_attr("top_pct", _calc_top_pct(scores))
             return float(np.median(scores[labeled_idx]))
 
     def _log_callback(study: "optuna.Study", trial: "optuna.Trial") -> None:
         n = trial.number + 1
         val = trial.value if trial.value is not None else float("nan")
+        top_pct = trial.user_attrs.get("top_pct", float("nan"))
         is_best = val == study.best_value
         # 10試行ごと or ベスト更新時にINFO出力
         if is_best or n % 10 == 0 or n == cfg.n_trials:
@@ -865,7 +873,8 @@ def tune_hyperparams(
                     f"{k}={v:.4g}" for k, v in trial.params.items()
                 ) + ")"
             logger.info(
-                f"  trial {n:>4d}/{cfg.n_trials}  score={val:.6f}{best_label}{params_str}"
+                f"  trial {n:>4d}/{cfg.n_trials}  score={val:.6f}"
+                f"  上位{top_pct:.2f}%{best_label}{params_str}"
             )
 
     study = optuna.create_study(direction="maximize")
