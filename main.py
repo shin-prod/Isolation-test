@@ -715,6 +715,37 @@ def select_features(
 
 
 # ============================================================
+# ラベル付き異常のパーセンタイル確認
+# ============================================================
+
+def _log_labeled_percentile(
+    anomaly_score: np.ndarray,
+    labeled_idx: np.ndarray,
+    label: str = "",
+) -> None:
+    """ラベル付き異常の異常スコア中央値が全体の上位何%にいるかをINFOで出力する。
+
+    Args:
+        anomaly_score: 全レコードの異常スコア配列
+        labeled_idx: ラベル付き異常のインデックス配列
+        label: ログの識別ラベル
+    """
+    labeled_scores = anomaly_score[labeled_idx]
+    median_score   = float(np.median(labeled_scores))
+    # 全体の中で median_score より低いスコアの割合 = 下位X% → 上位(100-X)%
+    percentile_from_bottom = float((anomaly_score < median_score).mean() * 100)
+    top_pct = 100.0 - percentile_from_bottom
+
+    prefix = f"[{label}] " if label else ""
+    logger.info(
+        f"{prefix}ラベル付き異常スコアの中央値: {median_score:.6f}  "
+        f"→ 全体の上位 {top_pct:.2f}% "
+        f"(N={len(labeled_idx)}件, "
+        f"min={labeled_scores.min():.4f}, max={labeled_scores.max():.4f})"
+    )
+
+
+# ============================================================
 # Optunaハイパーパラメータチューニング
 # ============================================================
 
@@ -798,6 +829,18 @@ def tune_hyperparams(
         f"  max_features={best['max_features']:.4f}\n"
         f"  max_samples={best['max_samples']:.4f}"
     )
+
+    # best_params でのスコアをパーセンタイルで確認
+    best_model = IsolationForest(
+        n_estimators=cfg.n_estimators,
+        contamination=best["contamination"],
+        max_features=best["max_features"],
+        max_samples=best["max_samples"],
+        random_state=cfg.random_state,
+    )
+    best_model.fit(X_scaled)
+    best_scores = -best_model.score_samples(X_scaled)
+    _log_labeled_percentile(best_scores, labeled_idx, "チューニング最良モデル")
 
     # チューニング結果をCSVに保存
     trials_df = study.trials_dataframe()[
@@ -1301,6 +1344,13 @@ def main() -> None:
 
         # 6. Isolation Forest
         model, anomaly_score, is_anomaly = run_isolation_forest(X_scaled, cfg)
+
+        # ラベル付き異常のパーセンタイル確認（--label-col 指定時のみ）
+        if cfg.label_col is not None:
+            labeled_idx = np.where(
+                original_df[cfg.label_col].values == cfg.label_anomaly_value
+            )[0]
+            _log_labeled_percentile(anomaly_score, labeled_idx, "最終モデル")
 
         # 7. SHAP
         shap_df, top_feature_arr, top_shap_value_arr = run_shap(
