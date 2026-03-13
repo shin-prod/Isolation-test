@@ -249,6 +249,7 @@ def _encode_column(
     forced_encoding: Optional[str] = None,              # "ohe" | "frequency" | "auto" | None
     forced_ohe_top_n: Optional[int] = None,             # カラム個別の上位N件
     forced_ohe_coverage_threshold: Optional[float] = None,  # カラム個別のカバレッジ閾値
+    prefix_n: Optional[int] = None,                     # 先頭N文字に切り詰め（Noneは無効）
 ) -> tuple[pd.DataFrame, dict]:
     """単一の object 型カラムを型判定してエンコードする。
 
@@ -267,10 +268,21 @@ def _encode_column(
         forced_encoding: エンコーディング方式（"ohe" / "frequency" / "auto" / None）
         forced_ohe_top_n: OHEの上位カテゴリ数（Noneの場合cfg.ohe_top_nを使用）
         forced_ohe_coverage_threshold: カバレッジ閾値（Noneの場合cfg.ohe_coverage_thresholdを使用）
+        prefix_n: 先頭N文字に切り詰めてからエンコード（Noneは無効）
 
     Returns:
         (エンコード処理後のDataFrame, エンコードサマリ dict)
     """
+    # ---- 先頭N文字への切り詰め ----
+    if prefix_n is not None:
+        n_unique_before = df[col].nunique()
+        df[col] = df[col].str[:prefix_n]
+        n_unique_after = df[col].nunique()
+        logger.info(
+            f"  先頭{prefix_n}文字に切り詰め [{col}]: "
+            f"ユニーク数 {n_unique_before} → {n_unique_after}"
+        )
+
     summary: dict = {
         "column": col,
         "encoding": "",
@@ -278,6 +290,7 @@ def _encode_column(
         "coverage_top_n": None,
         "other_count": None,
         "generated_columns": "",
+        "prefix_n": prefix_n,
     }
 
     # ---- 日付判定（forced_encoding 未指定時のみ / "auto" はスキップ）----
@@ -558,10 +571,12 @@ def preprocess(
         forced_enc       = spec.get("encoding")               # "ohe" | "frequency" | "auto" | None
         forced_topn      = spec.get("ohe_top_n")              # int | None
         forced_threshold = spec.get("ohe_coverage_threshold") # float | None
+        prefix_n         = spec.get("prefix_n")               # int | None
         logger.debug(
             f"カラム処理: {col} (dtype={dtype}, "
             f"forced_type={forced_type}, forced_enc={forced_enc}, "
-            f"forced_topn={forced_topn}, forced_threshold={forced_threshold})"
+            f"forced_topn={forced_topn}, forced_threshold={forced_threshold}, "
+            f"prefix_n={prefix_n})"
         )
 
         # JSON で type=numeric が指定された場合は強制数値変換
@@ -599,6 +614,7 @@ def preprocess(
                 forced_encoding=forced_enc,
                 forced_ohe_top_n=forced_topn,
                 forced_ohe_coverage_threshold=forced_threshold,
+                prefix_n=prefix_n,
             )
             encode_summaries.append(enc_summary)
 
@@ -1197,7 +1213,7 @@ def save_outputs(
     if encode_summaries:
         enc_df = pd.DataFrame(encode_summaries, columns=[
             "column", "encoding", "n_unique",
-            "coverage_top_n", "other_count", "generated_columns",
+            "coverage_top_n", "other_count", "generated_columns", "prefix_n",
         ])
         out_path = cfg.out_dir / "encoding_summary.csv"
         enc_df.to_csv(out_path, index=False, encoding="utf-8-sig")

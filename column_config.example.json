@@ -10,6 +10,8 @@
 
   "status":      {"use": true,  "type": "categorical", "encoding": "auto",
                   "ohe_top_n": 10, "ohe_coverage_threshold": 0.7},
+  "product_code":{"use": true,  "type": "categorical", "encoding": "ohe",
+                  "ohe_top_n": 20, "prefix_n": 3},
 
   "customer_id": {"use": false, "type": "categorical", "encoding": "frequency"}
 }
