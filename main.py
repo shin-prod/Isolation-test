@@ -876,9 +876,14 @@ def tune_hyperparams(
     )
 
     def _calc_top_pct(scores: np.ndarray) -> float:
-        """ラベル付き異常の中央値スコアが全体の上位何%かを返す。"""
+        """ラベル付き異常の中央値スコアが全体の上位何%かを返す。（低いほど良い）"""
         median_score = float(np.median(scores[labeled_idx]))
         return 100.0 - float((scores < median_score).mean() * 100)
+
+    def _objective_value(scores: np.ndarray) -> float:
+        """最適化目的関数値: 上位%を下げる = percentile_from_bottom を最大化。"""
+        top_pct = _calc_top_pct(scores)
+        return 100.0 - top_pct  # percentile_from_bottom（大きいほど良い）
 
     # LOF用: 特徴量インデックスマップ（重み配列の生成に使用）
     feat_idx: dict[str, int] = {f: i for i, f in enumerate(feature_names)}
@@ -911,7 +916,7 @@ def tune_hyperparams(
             model.fit_predict(X_weighted)
             scores = -model.negative_outlier_factor_
             trial.set_user_attr("top_pct", _calc_top_pct(scores))
-            return float(np.median(scores[labeled_idx]))
+            return _objective_value(scores)
     else:
         def objective(trial: "optuna.Trial") -> float:
             contamination = trial.suggest_float("contamination", 0.001, 0.10, log=True)
@@ -927,7 +932,7 @@ def tune_hyperparams(
             model.fit(X_scaled)
             scores = -model.score_samples(X_scaled)
             trial.set_user_attr("top_pct", _calc_top_pct(scores))
-            return float(np.median(scores[labeled_idx]))
+            return _objective_value(scores)
 
     def _log_callback(study: "optuna.Study", trial: "optuna.Trial") -> None:
         n = trial.number + 1
@@ -945,8 +950,7 @@ def tune_hyperparams(
                 if w_vals:
                     params_str += "  w=[" + ", ".join(f"{w:.2f}" for w in w_vals) + "]"
         logger.info(
-            f"  trial {n:>4d}/{cfg.n_trials}  score={val:.6f}"
-            f"  上位{top_pct:.2f}%{best_label}{params_str}"
+            f"  trial {n:>4d}/{cfg.n_trials}  上位{top_pct:.2f}%{best_label}{params_str}"
         )
 
     study = optuna.create_study(direction="maximize")
@@ -958,7 +962,10 @@ def tune_hyperparams(
     # 構造パラメータのみサマリ出力（重みは別途出力）
     struct_params = {k: v for k, v in best.items() if not k.startswith("w_")}
     params_summary = "\n".join(f"  {k}={v:.6g}" for k, v in struct_params.items())
-    logger.info(f"チューニング完了: best_value(中央値)={best_value:.6f}\n{params_summary}")
+    best_top_pct = 100.0 - best_value
+    logger.info(
+        f"チューニング完了: 上位{best_top_pct:.2f}%\n{params_summary}"
+    )
 
     # LOF: 最良重みを構築してログ出力
     lof_weights: Optional[np.ndarray] = None
