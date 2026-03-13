@@ -1488,8 +1488,8 @@ def _parse_args() -> argparse.Namespace:
                         help="LOF+Optuna時に特徴量重みをチューニングする。--no-lof-tune-weights で無効化")
 
     # --- カラム設定 ---
-    parser.add_argument("--column-config", type=Path, default=None,
-                        help="カラム設定JSONファイルのパス (例: column_config.json)")
+    parser.add_argument("--column-config", type=Path, default=Path("column_config.json"),
+                        help="カラム設定JSONファイルのパス (デフォルト: column_config.json)")
 
     return parser.parse_args()
 
