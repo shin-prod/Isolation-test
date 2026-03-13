@@ -1393,6 +1393,107 @@ def run_shap(
 
 
 # ============================================================
+# LOF 距離ベース特徴量寄与度分析
+# ============================================================
+
+@timed("LOF特徴量寄与度分析")
+def run_lof_contributions(
+    X_input: np.ndarray,
+    model: LocalOutlierFactor,
+    is_anomaly: np.ndarray,
+    feature_names: list[str],
+    shap_indices: Optional[np.ndarray],
+    cfg: Config,
+) -> tuple[Optional[pd.DataFrame], np.ndarray, np.ndarray]:
+    """LOF用距離ベース特徴量寄与度分析。
+
+    各レコードと近傍の二乗距離を特徴量ごとに分解し、
+    LOFスコアへの寄与度（合計1の比率）を算出する。
+
+    計算対象の優先順位:
+      1. shap_indices が指定されていればそのインデックス（label_col==1 など）
+      2. cfg.shap_all=True なら全件
+      3. それ以外は is_anomaly=1 のレコードのみ
+
+    Args:
+        X_input: LOFに入力した特徴量行列（重みづけ・標準化済み）
+        model: 学習済みLocalOutlierFactorモデル
+        is_anomaly: 異常フラグ配列
+        feature_names: 特徴量名リスト
+        shap_indices: 計算対象インデックス（Noneの場合は自動決定）
+        cfg: 実行設定
+
+    Returns:
+        (contrib_df or None, top_feature_arr, top_contrib_arr)
+        contrib_df: 各レコードの特徴量別寄与比率 (行=対象レコード, 列=特徴量)
+    """
+    n = len(X_input)
+    top_feature_arr = np.full(n, "", dtype=object)
+    top_contrib_arr = np.zeros(n)
+
+    # 計算対象インデックスの決定
+    if cfg.shap_all:
+        target_indices = np.arange(n)
+        logger.info(f"LOF寄与度: 全件計算 ({n}件)")
+    elif shap_indices is not None:
+        target_indices = shap_indices
+        logger.info(
+            f"LOF寄与度: ラベル付き異常レコードのみ計算 ({len(target_indices)} / {n}件)"
+        )
+    else:
+        target_indices = np.where(is_anomaly == 1)[0]
+        logger.info(
+            f"LOF寄与度: 異常レコードのみ計算 ({len(target_indices)} / {n}件)"
+        )
+
+    if len(target_indices) == 0:
+        logger.warning("LOF寄与度計算対象レコードがありません。")
+        return None, top_feature_arr, top_contrib_arr
+
+    try:
+        # LOFの内部kNNから近傍インデックスを取得（自己参照を除く）
+        n_neighbors = model.n_neighbors_
+        _, nbr_indices_all = model.kneighbors(
+            X_input, n_neighbors=n_neighbors + 1
+        )
+        nbr_indices_all = nbr_indices_all[:, 1:]  # 先頭は自己参照 → 除外
+
+        contributions = []
+        for i in target_indices:
+            nbr_X = X_input[nbr_indices_all[i]]        # (k, p)
+            diffs_sq = (X_input[i] - nbr_X) ** 2       # (k, p) 二乗距離
+            feat_contrib = diffs_sq.mean(axis=0)        # (p,) 近傍平均
+            total = float(feat_contrib.sum())
+            if total > 0:
+                feat_contrib_norm = feat_contrib / total  # 合計=1 に正規化
+            else:
+                feat_contrib_norm = np.ones(len(feature_names)) / len(feature_names)
+
+            contributions.append(feat_contrib_norm)
+            top_j = int(np.argmax(feat_contrib_norm))
+            top_feature_arr[i] = feature_names[top_j]
+            top_contrib_arr[i] = float(feat_contrib_norm[top_j])
+
+        contrib_df = pd.DataFrame(
+            contributions, columns=feature_names, index=target_indices
+        )
+
+        # 特徴量別 平均寄与度ランキング（上位10件をINFO出力）
+        mean_contrib = contrib_df.mean(axis=0).sort_values(ascending=False)
+        logger.info("LOF寄与度ランキング (上位10):")
+        for rank, (feat, val) in enumerate(mean_contrib.head(10).items(), 1):
+            logger.info(f"  {rank:2d}. {feat}: {val:.4f}")
+
+        logger.info("LOF寄与度計算完了")
+        return contrib_df, top_feature_arr, top_contrib_arr
+
+    except Exception as e:
+        logger.warning(f"LOF寄与度計算エラーのためスキップ: {e}")
+        logger.debug(traceback.format_exc())
+        return None, top_feature_arr, top_contrib_arr
+
+
+# ============================================================
 # PCA / MCA
 # ============================================================
 
@@ -1610,14 +1711,14 @@ def save_outputs(
     )
     logger.debug(f"  → {out_path.resolve()}")
 
-    # ---- shap_summary.csv ----
+    # ---- feature_contribution.csv（SHAP値 or LOF距離寄与度）----
     if results.shap_df is not None:
-        out_path = cfg.out_dir / "shap_summary.csv"
+        out_path = cfg.out_dir / "feature_contribution.csv"
         results.shap_df.to_csv(out_path, encoding="utf-8-sig")
-        logger.info(f"出力: shap_summary.csv ({len(results.shap_df)}件)")
+        logger.info(f"出力: feature_contribution.csv ({len(results.shap_df)}件)")
         logger.debug(f"  → {out_path.resolve()}")
     else:
-        logger.info("SHAP出力スキップ")
+        logger.info("特徴量寄与度出力スキップ")
 
     # ---- pca_2d.csv（DIM1, DIM2, 異常情報, 元データ全列）----
     pca_df = pd.DataFrame({
@@ -1872,17 +1973,27 @@ def main() -> None:
             )[0]
             _log_labeled_percentile(anomaly_score, labeled_idx, "最終モデル")
 
-        # 7. SHAP（デフォルトは label_col==label_anomaly_value のレコード）
+        # 7. SHAP (IF) / 距離ベース寄与度 (LOF)
+        # デフォルト対象: label_col指定時はlabel_col==label_anomaly_valueのレコード
         if not cfg.shap_all and cfg.label_col is not None:
             shap_indices = np.where(
                 original_df[cfg.label_col].values == cfg.label_anomaly_value
             )[0]
         else:
             shap_indices = None
-        shap_df, top_feature_arr, top_shap_value_arr = run_shap(
-            model, X_scaled, is_anomaly, feature_names, cfg,
-            shap_indices=shap_indices,
-        )
+
+        if cfg.method == "lof":
+            # LOF: 近傍との二乗距離を特徴量ごとに分解して寄与度を算出
+            X_lof_input = X_scaled * lof_weights if lof_weights is not None else X_scaled
+            shap_df, top_feature_arr, top_shap_value_arr = run_lof_contributions(
+                X_lof_input, model, is_anomaly, feature_names, shap_indices, cfg
+            )
+        else:
+            # IF: TreeExplainer による SHAP 値
+            shap_df, top_feature_arr, top_shap_value_arr = run_shap(
+                model, X_scaled, is_anomaly, feature_names, cfg,
+                shap_indices=shap_indices,
+            )
 
         # 8. PCA/MCA ハイブリッド（数値軸=PCA, OHE軸=MCA）
         pca_coords, pca_dim_info = run_pca_mca(
