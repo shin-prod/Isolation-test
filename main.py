@@ -19,7 +19,8 @@ import logging
 import sys
 import time
 import traceback
-from dataclasses import dataclass, field
+import pickle
+from dataclasses import dataclass, field, replace
 from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -84,6 +85,7 @@ class Config:
     # --- パス ---
     in_dir: Path = field(default_factory=lambda: Path("in"))
     out_dir: Path = field(default_factory=lambda: Path("out"))
+    model_dir: Path = field(default_factory=lambda: Path("models"))
     column_config_path: Optional[Path] = None   # カラム設定JSONのパス
 
 
@@ -793,6 +795,87 @@ def _log_labeled_percentile(
 
 
 # ============================================================
+# チューニング結果の保存・ロード
+# ============================================================
+
+def save_best_params(
+    cfg: Config,
+    lof_weights: Optional[np.ndarray],
+) -> None:
+    """チューニング結果（ハイパーパラメータ + LOF重み）をpklで保存する。
+
+    Args:
+        cfg: チューニング後の Config
+        lof_weights: LOF用重み配列（IFの場合は None）
+    """
+    pkl_path = cfg.model_dir / "best_params.pkl"
+    cfg.model_dir.mkdir(exist_ok=True)
+    data = {
+        "method":          cfg.method,
+        "contamination":   cfg.contamination,
+        "lof_n_neighbors": cfg.lof_n_neighbors,
+        "max_features":    cfg.max_features,
+        "max_samples":     cfg.max_samples,
+        "lof_weights":     lof_weights,
+    }
+    with open(pkl_path, "wb") as f:
+        pickle.dump(data, f)
+    logger.info(f"チューニング結果を保存: {pkl_path.resolve()}")
+    logger.info(
+        f"  method={data['method']}, contamination={data['contamination']:.6f}"
+        + (f", n_neighbors={data['lof_n_neighbors']}" if cfg.method == "lof" else
+           f", max_features={data['max_features']:.4f}, max_samples={data['max_samples']:.4f}")
+    )
+
+
+def load_best_params(
+    cfg: Config,
+) -> tuple[Config, Optional[np.ndarray]]:
+    """pklからチューニング結果を読み込み、Config と LOF重み配列を返す。
+
+    Args:
+        cfg: 現在の Config（pkl の値で上書きする）
+
+    Returns:
+        (更新された Config, LOF用重み配列 or None)
+
+    Raises:
+        AnomalyDetectionError: ファイルの読み込み・形式エラー
+    """
+    pkl_path = cfg.model_dir / "best_params.pkl"
+    try:
+        with open(pkl_path, "rb") as f:
+            data = pickle.load(f)
+    except Exception as e:
+        raise AnomalyDetectionError(
+            f"チューニング結果pklの読み込みエラー: {e}\n  ファイル: {pkl_path}"
+        ) from e
+
+    lof_weights: Optional[np.ndarray] = data.get("lof_weights")
+
+    new_cfg = replace(
+        cfg,
+        contamination=data["contamination"],
+        lof_n_neighbors=data.get("lof_n_neighbors", cfg.lof_n_neighbors),
+        max_features=data.get("max_features", cfg.max_features),
+        max_samples=data.get("max_samples", cfg.max_samples),
+    )
+
+    logger.info(f"チューニング結果をロード: {pkl_path.resolve()}")
+    logger.info(
+        f"  method={data.get('method', '?')}, contamination={new_cfg.contamination:.6f}"
+        + (f", n_neighbors={new_cfg.lof_n_neighbors}" if cfg.method == "lof" else
+           f", max_features={new_cfg.max_features:.4f}, max_samples={new_cfg.max_samples:.4f}")
+    )
+    if lof_weights is not None:
+        logger.info(
+            f"  重みづけ: min={lof_weights.min():.4f}, "
+            f"max={lof_weights.max():.4f}, mean={lof_weights.mean():.4f}"
+        )
+    return new_cfg, lof_weights
+
+
+# ============================================================
 # カラムグループ構築（OHE展開前の元カラム → 展開後カラムのマッピング）
 # ============================================================
 
@@ -1058,6 +1141,7 @@ def tune_hyperparams(
         lof_tune_weights=cfg.lof_tune_weights,
         in_dir=cfg.in_dir,
         out_dir=cfg.out_dir,
+        model_dir=cfg.model_dir,
         column_config_path=cfg.column_config_path,
     )
     if cfg.method == "lof":
@@ -1473,6 +1557,8 @@ def _parse_args() -> argparse.Namespace:
                         help="入力CSVフォルダのパス")
     parser.add_argument("--out-dir", type=Path, default=Path("out"),
                         help="出力フォルダのパス")
+    parser.add_argument("--model-dir", type=Path, default=Path("models"),
+                        help="チューニング結果pkl の保存・読み込みフォルダ (デフォルト: models)")
     parser.add_argument("--encoding", type=str, default="cp932",
                         help="入力CSVの文字コード (cp932=Shift-JIS, utf-8 など)")
 
@@ -1536,6 +1622,7 @@ def main() -> None:
     cfg = Config(
         in_dir=args.in_dir,
         out_dir=args.out_dir,
+        model_dir=args.model_dir,
         input_encoding=args.encoding,
         contamination=args.contamination,
         n_estimators=args.n_estimators,
@@ -1627,8 +1714,10 @@ def main() -> None:
             f"特徴量グループ: {len(column_groups)}元カラム / {len(feature_names)}特徴量"
         )
 
-        # 5. Optunaチューニング（--tune かつ --label-col 指定時のみ）
+        # 5. チューニング / pkl ロード
         lof_weights: Optional[np.ndarray] = None
+        pkl_path = cfg.model_dir / "best_params.pkl"
+
         if cfg.tune:
             if cfg.label_col is None:
                 raise AnomalyDetectionError(
@@ -1636,6 +1725,14 @@ def main() -> None:
                 )
             cfg, lof_weights = tune_hyperparams(
                 X_scaled, original_df, cfg, feature_names, column_groups
+            )
+            save_best_params(cfg, lof_weights)
+        elif pkl_path.exists():
+            logger.info(f"pklファイルを検出。チューニング結果をロードします: {pkl_path}")
+            cfg, lof_weights = load_best_params(cfg)
+        else:
+            logger.info(
+                f"チューニングなし・pklなし ({pkl_path}): デフォルトパラメータで実行します。"
             )
 
         # 6. 異常検知モデル（IF または LOF）
