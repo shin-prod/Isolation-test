@@ -22,13 +22,14 @@ import traceback
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 import pandas as pd
 import shap
 from sklearn.decomposition import PCA
 from sklearn.ensemble import IsolationForest
+from sklearn.neighbors import LocalOutlierFactor
 from sklearn.preprocessing import StandardScaler
 
 # ============================================================
@@ -74,6 +75,10 @@ class Config:
     label_anomaly_value: int = 1            # 異常を示すラベル値
     tune: bool = False                      # True: Optunaチューニングを実行
     n_trials: int = 100                     # Optunaの試行回数
+
+    # --- モデル手法 ---
+    method: str = "if"                      # "if": Isolation Forest / "lof": Local Outlier Factor
+    lof_n_neighbors: int = 20               # LOFの近傍数
 
     # --- パス ---
     in_dir: Path = field(default_factory=lambda: Path("in"))
@@ -819,23 +824,33 @@ def tune_hyperparams(
         f"試行回数={cfg.n_trials}"
     )
 
-    def objective(trial: "optuna.Trial") -> float:
-        contamination = trial.suggest_float("contamination", 0.001, 0.10, log=True)
-        max_features  = trial.suggest_float("max_features",  0.3,   1.0)
-        max_samples   = trial.suggest_float("max_samples",   0.1,   1.0)
-
-        model = IsolationForest(
-            n_estimators=cfg.n_estimators,
-            contamination=contamination,
-            max_features=max_features,
-            max_samples=max_samples,
-            random_state=cfg.random_state,
-        )
-        model.fit(X_scaled)
-        scores = -model.score_samples(X_scaled)
-        return float(np.median(scores[labeled_idx]))
-
-    best_so_far: list[float] = []  # ミュータブルなセルとしてコールバックで参照
+    if cfg.method == "lof":
+        def objective(trial: "optuna.Trial") -> float:
+            n_neighbors   = trial.suggest_int("n_neighbors", 5, 50)
+            contamination = trial.suggest_float("contamination", 0.001, 0.10, log=True)
+            model = LocalOutlierFactor(
+                n_neighbors=n_neighbors,
+                contamination=contamination,
+                novelty=False,
+            )
+            model.fit_predict(X_scaled)
+            scores = -model.negative_outlier_factor_
+            return float(np.median(scores[labeled_idx]))
+    else:
+        def objective(trial: "optuna.Trial") -> float:
+            contamination = trial.suggest_float("contamination", 0.001, 0.10, log=True)
+            max_features  = trial.suggest_float("max_features",  0.3,   1.0)
+            max_samples   = trial.suggest_float("max_samples",   0.1,   1.0)
+            model = IsolationForest(
+                n_estimators=cfg.n_estimators,
+                contamination=contamination,
+                max_features=max_features,
+                max_samples=max_samples,
+                random_state=cfg.random_state,
+            )
+            model.fit(X_scaled)
+            scores = -model.score_samples(X_scaled)
+            return float(np.median(scores[labeled_idx]))
 
     def _log_callback(study: "optuna.Study", trial: "optuna.Trial") -> None:
         n = trial.number + 1
@@ -844,12 +859,13 @@ def tune_hyperparams(
         # 10試行ごと or ベスト更新時にINFO出力
         if is_best or n % 10 == 0 or n == cfg.n_trials:
             best_label = " ★best更新" if is_best else ""
+            params_str = ""
+            if is_best:
+                params_str = "  (" + ", ".join(
+                    f"{k}={v:.4g}" for k, v in trial.params.items()
+                ) + ")"
             logger.info(
-                f"  trial {n:>4d}/{cfg.n_trials}  score={val:.6f}{best_label}"
-                + (f"  (contamination={trial.params['contamination']:.5f}"
-                   f", max_features={trial.params['max_features']:.3f}"
-                   f", max_samples={trial.params['max_samples']:.3f})"
-                   if is_best else "")
+                f"  trial {n:>4d}/{cfg.n_trials}  score={val:.6f}{best_label}{params_str}"
             )
 
     study = optuna.create_study(direction="maximize")
@@ -857,40 +873,46 @@ def tune_hyperparams(
 
     best = study.best_params
     best_value = study.best_value
-    logger.info(
-        f"チューニング完了: best_value(中央値)={best_value:.6f}\n"
-        f"  contamination={best['contamination']:.6f}\n"
-        f"  max_features={best['max_features']:.4f}\n"
-        f"  max_samples={best['max_samples']:.4f}"
-    )
+    params_summary = "\n".join(f"  {k}={v:.6g}" for k, v in best.items())
+    logger.info(f"チューニング完了: best_value(中央値)={best_value:.6f}\n{params_summary}")
 
     # best_params でのスコアをパーセンタイルで確認
-    best_model = IsolationForest(
-        n_estimators=cfg.n_estimators,
-        contamination=best["contamination"],
-        max_features=best["max_features"],
-        max_samples=best["max_samples"],
-        random_state=cfg.random_state,
-    )
-    best_model.fit(X_scaled)
-    best_scores = -best_model.score_samples(X_scaled)
+    if cfg.method == "lof":
+        best_model = LocalOutlierFactor(
+            n_neighbors=best["n_neighbors"],
+            contamination=best["contamination"],
+            novelty=False,
+        )
+        best_model.fit_predict(X_scaled)
+        best_scores = -best_model.negative_outlier_factor_
+    else:
+        best_model = IsolationForest(
+            n_estimators=cfg.n_estimators,
+            contamination=best["contamination"],
+            max_features=best["max_features"],
+            max_samples=best["max_samples"],
+            random_state=cfg.random_state,
+        )
+        best_model.fit(X_scaled)
+        best_scores = -best_model.score_samples(X_scaled)
     _log_labeled_percentile(best_scores, labeled_idx, "チューニング最良モデル")
 
     # チューニング結果をCSVに保存
+    all_cols = study.trials_dataframe().columns.tolist()
+    param_cols = [c for c in all_cols if c.startswith("params_")]
     trials_df = study.trials_dataframe()[
-        ["number", "value", "params_contamination", "params_max_features", "params_max_samples"]
+        ["number", "value"] + param_cols
     ].sort_values("value", ascending=False)
     out_path = cfg.out_dir / "tuning_results.csv"
     trials_df.to_csv(out_path, index=False, encoding="utf-8-sig")
     logger.info(f"出力: tuning_results.csv ({len(trials_df)}試行)")
 
-    # best_params を Config に反映して返す
-    return Config(
+    # best_params を Config に反映して返す（共通フィールド）
+    common_kwargs = dict(
         contamination=best["contamination"],
-        max_features=best["max_features"],
-        max_samples=best["max_samples"],
         n_estimators=cfg.n_estimators,
         random_state=cfg.random_state,
+        input_encoding=cfg.input_encoding,
         missing_rate_threshold=cfg.missing_rate_threshold,
         date_parse_threshold=cfg.date_parse_threshold,
         ohe_top_n=cfg.ohe_top_n,
@@ -902,10 +924,19 @@ def tune_hyperparams(
         label_col=cfg.label_col,
         label_anomaly_value=cfg.label_anomaly_value,
         n_trials=cfg.n_trials,
+        method=cfg.method,
+        lof_n_neighbors=cfg.lof_n_neighbors,
         in_dir=cfg.in_dir,
         out_dir=cfg.out_dir,
         column_config_path=cfg.column_config_path,
     )
+    if cfg.method == "lof":
+        common_kwargs["lof_n_neighbors"] = best["n_neighbors"]
+    else:
+        common_kwargs["max_features"] = best["max_features"]
+        common_kwargs["max_samples"]  = best["max_samples"]
+
+    return Config(**common_kwargs)
 
 
 # ============================================================
@@ -970,12 +1001,67 @@ def run_isolation_forest(
 
 
 # ============================================================
+# Local Outlier Factor
+# ============================================================
+
+@timed("Local Outlier Factor")
+def run_lof(
+    X_scaled: np.ndarray, cfg: Config
+) -> tuple[LocalOutlierFactor, np.ndarray, np.ndarray]:
+    """Local Outlier Factorで異常スコアと異常フラグを算出する。
+
+    Args:
+        X_scaled: 標準化済み特徴量行列
+        cfg: 実行設定
+
+    Returns:
+        (学習済みモデル, anomaly_score, is_anomaly)
+    """
+    logger.info(
+        f"パラメータ: n_neighbors={cfg.lof_n_neighbors}, "
+        f"contamination={cfg.contamination}"
+    )
+    logger.debug(f"入力行列: shape={X_scaled.shape}")
+
+    model = LocalOutlierFactor(
+        n_neighbors=cfg.lof_n_neighbors,
+        contamination=cfg.contamination,
+        novelty=False,
+    )
+    is_anomaly_raw = model.fit_predict(X_scaled)
+
+    # negative_outlier_factor_ はマイナス値（より負 = より異常）
+    # 反転して「高いほど異常」なスコアにする
+    anomaly_score = -model.negative_outlier_factor_
+    is_anomaly = (is_anomaly_raw == -1).astype(int)
+
+    n_anomaly = int(is_anomaly.sum())
+    n_total = len(is_anomaly)
+    logger.info(
+        f"異常件数: {n_anomaly} / {n_total} 件 ({n_anomaly / n_total:.1%})"
+    )
+    logger.debug(
+        f"anomaly_score: min={anomaly_score.min():.4f}, "
+        f"max={anomaly_score.max():.4f}, "
+        f"mean={anomaly_score.mean():.4f}, "
+        f"std={anomaly_score.std():.4f}, "
+        f"p95={float(np.percentile(anomaly_score, 95)):.4f}"
+    )
+    threshold_score = float(
+        np.percentile(anomaly_score, 100 * (1 - cfg.contamination))
+    )
+    logger.debug(f"異常判定閾値スコア (上位{cfg.contamination:.0%}): {threshold_score:.4f}")
+
+    return model, anomaly_score, is_anomaly
+
+
+# ============================================================
 # SHAP
 # ============================================================
 
 @timed("SHAP分析")
 def run_shap(
-    model: IsolationForest,
+    model: Any,
     X_scaled: np.ndarray,
     is_anomaly: np.ndarray,
     feature_names: list[str],
@@ -984,10 +1070,11 @@ def run_shap(
     """SHAP値を算出し、各レコードの最大寄与特徴量を特定する。
 
     計算対象は cfg.shap_all=False の場合は is_anomaly=1 のレコードのみ。
+    LOFモデルの場合はSHAPをスキップする。
     エラー発生時は警告ログを出力しスキップ（result.csv は出力継続）。
 
     Args:
-        model: 学習済みIsolation Forestモデル
+        model: 学習済みモデル（IsolationForest / LocalOutlierFactor）
         X_scaled: 標準化済み特徴量行列
         is_anomaly: 異常フラグ配列
         feature_names: 特徴量名リスト
@@ -999,6 +1086,11 @@ def run_shap(
     n = len(X_scaled)
     top_feature_arr = np.full(n, "", dtype=object)
     top_shap_value_arr = np.zeros(n)
+
+    # LOFはSHAP TreeExplainerに非対応のためスキップ
+    if isinstance(model, LocalOutlierFactor):
+        logger.info("SHAP: LOFモデルはSHAP非対応のためスキップします。")
+        return None, top_feature_arr, top_shap_value_arr
 
     try:
         logger.debug("TreeExplainer 初期化中...")
@@ -1231,7 +1323,7 @@ def save_outputs(
 def _parse_args() -> argparse.Namespace:
     """コマンドライン引数を解析する。"""
     parser = argparse.ArgumentParser(
-        description="異常検知システム (Isolation Forest + SHAP + PCA)",
+        description="異常検知システム (Isolation Forest / LOF + SHAP + PCA)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -1281,6 +1373,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--pca-variance-warning", type=float, default=0.50,
                         help="PCA累積寄与率がこの値を下回ると警告")
 
+    # --- モデル手法 ---
+    parser.add_argument("--method", type=str, choices=["if", "lof"], default="if",
+                        help="異常検知手法: if=Isolation Forest, lof=Local Outlier Factor")
+    parser.add_argument("--lof-n-neighbors", type=int, default=20,
+                        help="LOFの近傍数 (--method lof 時に使用)")
+
     # --- カラム設定 ---
     parser.add_argument("--column-config", type=Path, default=None,
                         help="カラム設定JSONファイルのパス (例: column_config.json)")
@@ -1310,6 +1408,8 @@ def main() -> None:
         label_anomaly_value=args.label_anomaly_value,
         tune=args.tune,
         n_trials=args.n_trials,
+        method=args.method,
+        lof_n_neighbors=args.lof_n_neighbors,
         column_config_path=args.column_config,
     )
 
@@ -1383,8 +1483,11 @@ def main() -> None:
                 )
             cfg = tune_hyperparams(X_scaled, original_df, cfg)
 
-        # 6. Isolation Forest
-        model, anomaly_score, is_anomaly = run_isolation_forest(X_scaled, cfg)
+        # 6. 異常検知モデル（IF または LOF）
+        if cfg.method == "lof":
+            model, anomaly_score, is_anomaly = run_lof(X_scaled, cfg)
+        else:
+            model, anomaly_score, is_anomaly = run_isolation_forest(X_scaled, cfg)
 
         # ラベル付き異常のパーセンタイル確認（--label-col 指定時のみ）
         if cfg.label_col is not None:
