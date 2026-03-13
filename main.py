@@ -864,18 +864,17 @@ def tune_hyperparams(
         val = trial.value if trial.value is not None else float("nan")
         top_pct = trial.user_attrs.get("top_pct", float("nan"))
         is_best = val == study.best_value
-        # 10試行ごと or ベスト更新時にINFO出力
-        if is_best or n % 10 == 0 or n == cfg.n_trials:
-            best_label = " ★best更新" if is_best else ""
-            params_str = ""
-            if is_best:
-                params_str = "  (" + ", ".join(
-                    f"{k}={v:.4g}" for k, v in trial.params.items()
-                ) + ")"
-            logger.info(
-                f"  trial {n:>4d}/{cfg.n_trials}  score={val:.6f}"
-                f"  上位{top_pct:.2f}%{best_label}{params_str}"
-            )
+        # 全試行をINFO出力
+        best_label = " ★best更新" if is_best else ""
+        params_str = ""
+        if is_best:
+            params_str = "  (" + ", ".join(
+                f"{k}={v:.4g}" for k, v in trial.params.items()
+            ) + ")"
+        logger.info(
+            f"  trial {n:>4d}/{cfg.n_trials}  score={val:.6f}"
+            f"  上位{top_pct:.2f}%{best_label}{params_str}"
+        )
 
     study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=cfg.n_trials, callbacks=[_log_callback])
