@@ -768,6 +768,47 @@ def _log_labeled_percentile(
 
 
 # ============================================================
+# カラムグループ構築（OHE展開前の元カラム → 展開後カラムのマッピング）
+# ============================================================
+
+def build_column_groups(
+    feature_names: list[str],
+    encode_summaries: list[dict],
+) -> dict[str, list[str]]:
+    """元カラム名をキーに、展開後の特徴量名リストをまとめた辞書を返す。
+
+    OHEで複数列に展開されたカラムは元カラム名にまとめられる。
+    日付分解されたカラムも元カラム名でグループ化される。
+    数値カラムは1対1（元カラム名 = 特徴量名）。
+
+    Args:
+        feature_names: 前処理・特徴量選択後の特徴量名リスト
+        encode_summaries: preprocess() が返すエンコードサマリリスト
+
+    Returns:
+        {元カラム名: [特徴量名, ...]} の辞書（feature_names の順序を保持）
+    """
+    # 展開後カラム → 元カラム名 の逆引き辞書を構築
+    generated_to_original: dict[str, str] = {}
+    for s in encode_summaries:
+        orig = s["column"]
+        generated = s.get("generated_columns") or ""
+        for gen_col in [c.strip() for c in generated.split(",") if c.strip()]:
+            generated_to_original[gen_col] = orig
+
+    # feature_names を元カラム名でグループ化
+    groups: dict[str, list[str]] = {}
+    for feat in feature_names:
+        orig = generated_to_original.get(feat, feat)  # 変換なし数値列は自己マッピング
+        groups.setdefault(orig, []).append(feat)
+
+    logger.debug(f"column_groups: {len(groups)}グループ / {len(feature_names)}特徴量")
+    for orig, feats in groups.items():
+        logger.debug(f"  {orig}: {feats}")
+    return groups
+
+
+# ============================================================
 # Optunaハイパーパラメータチューニング
 # ============================================================
 
@@ -776,19 +817,28 @@ def tune_hyperparams(
     X_scaled: np.ndarray,
     original_df: pd.DataFrame,
     cfg: Config,
-) -> Config:
-    """Optunaでハイパーパラメータを探索し、最適なConfigを返す。
+    feature_names: list[str],
+    column_groups: dict[str, list[str]],
+) -> tuple[Config, Optional[np.ndarray]]:
+    """Optunaでハイパーパラメータを探索し、最適な Config と重み配列を返す。
 
     目的関数: ラベル付き異常レコードの anomaly_score 中央値を最大化。
-    探索対象: contamination / max_features / max_samples
+
+    IF 探索対象: contamination / max_features / max_samples
+    LOF 探索対象: n_neighbors / contamination / 元カラムごとの特徴量重み
+
+    LOF の重みは元カラム単位（OHE展開前）で決定し、展開後の全列に適用する。
+    これにより「region に高い重みを与える」という直感的な操作が可能になる。
 
     Args:
         X_scaled: 標準化済み特徴量行列
         original_df: 元データ（ラベル列を含む）
         cfg: 現在の設定
+        feature_names: 前処理後の特徴量名リスト
+        column_groups: build_column_groups() の出力（元カラム → 特徴量名リスト）
 
     Returns:
-        best_params で上書きした新しい Config
+        (best_params で上書きした Config, LOF用重み配列 or None)
 
     Raises:
         AnomalyDetectionError: ラベル列が存在しない / 異常レコードが0件
@@ -829,16 +879,34 @@ def tune_hyperparams(
         median_score = float(np.median(scores[labeled_idx]))
         return 100.0 - float((scores < median_score).mean() * 100)
 
+    # LOF用: 特徴量インデックスマップ（重み配列の生成に使用）
+    feat_idx: dict[str, int] = {f: i for i, f in enumerate(feature_names)}
+
+    def _build_weight_array(trial_params: dict) -> np.ndarray:
+        """trial.params から元カラム単位の重みを展開した配列を生成する。"""
+        weights = np.ones(len(feature_names))
+        for orig_col, feat_cols in column_groups.items():
+            w = trial_params.get(f"w_{orig_col}", 1.0)
+            for fc in feat_cols:
+                if fc in feat_idx:
+                    weights[feat_idx[fc]] = w
+        return weights
+
     if cfg.method == "lof":
         def objective(trial: "optuna.Trial") -> float:
             n_neighbors   = trial.suggest_int("n_neighbors", 5, 50)
             contamination = trial.suggest_float("contamination", 0.001, 0.10, log=True)
+            # 元カラム単位で重みを探索（OHE展開前に決定）
+            for orig_col in column_groups:
+                trial.suggest_float(f"w_{orig_col}", 0.1, 3.0)
+            weights = _build_weight_array(trial.params)
+            X_weighted = X_scaled * weights
             model = LocalOutlierFactor(
                 n_neighbors=n_neighbors,
                 contamination=contamination,
                 novelty=False,
             )
-            model.fit_predict(X_scaled)
+            model.fit_predict(X_weighted)
             scores = -model.negative_outlier_factor_
             trial.set_user_attr("top_pct", _calc_top_pct(scores))
             return float(np.median(scores[labeled_idx]))
@@ -864,13 +932,12 @@ def tune_hyperparams(
         val = trial.value if trial.value is not None else float("nan")
         top_pct = trial.user_attrs.get("top_pct", float("nan"))
         is_best = val == study.best_value
-        # 全試行をINFO出力
         best_label = " ★best更新" if is_best else ""
+        # best更新時は構造パラメータ（重みを除く）のみ表示（ログが長くなりすぎないよう）
         params_str = ""
         if is_best:
-            params_str = "  (" + ", ".join(
-                f"{k}={v:.4g}" for k, v in trial.params.items()
-            ) + ")"
+            struct = {k: v for k, v in trial.params.items() if not k.startswith("w_")}
+            params_str = "  (" + ", ".join(f"{k}={v:.4g}" for k, v in struct.items()) + ")"
         logger.info(
             f"  trial {n:>4d}/{cfg.n_trials}  score={val:.6f}"
             f"  上位{top_pct:.2f}%{best_label}{params_str}"
@@ -881,8 +948,24 @@ def tune_hyperparams(
 
     best = study.best_params
     best_value = study.best_value
-    params_summary = "\n".join(f"  {k}={v:.6g}" for k, v in best.items())
+
+    # 構造パラメータのみサマリ出力（重みは別途出力）
+    struct_params = {k: v for k, v in best.items() if not k.startswith("w_")}
+    params_summary = "\n".join(f"  {k}={v:.6g}" for k, v in struct_params.items())
     logger.info(f"チューニング完了: best_value(中央値)={best_value:.6f}\n{params_summary}")
+
+    # LOF: 最良重みを構築してログ出力
+    lof_weights: Optional[np.ndarray] = None
+    if cfg.method == "lof":
+        lof_weights = _build_weight_array(best)
+        weight_by_orig = {
+            orig: float(best.get(f"w_{orig}", 1.0))
+            for orig in column_groups
+        }
+        sorted_weights = sorted(weight_by_orig.items(), key=lambda x: -x[1])
+        logger.info("最良重み（元カラム単位、降順）:")
+        for orig_col, w in sorted_weights:
+            logger.info(f"  {orig_col:<30} {w:.4f}")
 
     # best_params でのスコアをパーセンタイルで確認
     if cfg.method == "lof":
@@ -891,7 +974,8 @@ def tune_hyperparams(
             contamination=best["contamination"],
             novelty=False,
         )
-        best_model.fit_predict(X_scaled)
+        X_best = X_scaled * lof_weights if lof_weights is not None else X_scaled
+        best_model.fit_predict(X_best)
         best_scores = -best_model.negative_outlier_factor_
     else:
         best_model = IsolationForest(
@@ -905,7 +989,7 @@ def tune_hyperparams(
         best_scores = -best_model.score_samples(X_scaled)
     _log_labeled_percentile(best_scores, labeled_idx, "チューニング最良モデル")
 
-    # チューニング結果をCSVに保存
+    # チューニング結果をCSVに保存（重みカラムは w_ プレフィックス付きで含む）
     all_cols = study.trials_dataframe().columns.tolist()
     param_cols = [c for c in all_cols if c.startswith("params_")]
     trials_df = study.trials_dataframe()[
@@ -915,7 +999,7 @@ def tune_hyperparams(
     trials_df.to_csv(out_path, index=False, encoding="utf-8-sig")
     logger.info(f"出力: tuning_results.csv ({len(trials_df)}試行)")
 
-    # best_params を Config に反映して返す（共通フィールド）
+    # best_params を Config に反映して返す
     common_kwargs = dict(
         contamination=best["contamination"],
         n_estimators=cfg.n_estimators,
@@ -944,7 +1028,7 @@ def tune_hyperparams(
         common_kwargs["max_features"] = best["max_features"]
         common_kwargs["max_samples"]  = best["max_samples"]
 
-    return Config(**common_kwargs)
+    return Config(**common_kwargs), lof_weights
 
 
 # ============================================================
@@ -1014,13 +1098,17 @@ def run_isolation_forest(
 
 @timed("Local Outlier Factor")
 def run_lof(
-    X_scaled: np.ndarray, cfg: Config
+    X_scaled: np.ndarray,
+    cfg: Config,
+    weights: Optional[np.ndarray] = None,
 ) -> tuple[LocalOutlierFactor, np.ndarray, np.ndarray]:
     """Local Outlier Factorで異常スコアと異常フラグを算出する。
 
     Args:
         X_scaled: 標準化済み特徴量行列
         cfg: 実行設定
+        weights: 特徴量重み配列（Noneの場合は重みなし）。
+                 チューニング結果の重みを渡すと距離計算に反映される。
 
     Returns:
         (学習済みモデル, anomaly_score, is_anomaly)
@@ -1029,14 +1117,21 @@ def run_lof(
         f"パラメータ: n_neighbors={cfg.lof_n_neighbors}, "
         f"contamination={cfg.contamination}"
     )
+    if weights is not None:
+        logger.info(
+            f"特徴量重みづけ適用: min={weights.min():.4f}, "
+            f"max={weights.max():.4f}, mean={weights.mean():.4f}"
+        )
     logger.debug(f"入力行列: shape={X_scaled.shape}")
+
+    X_input = X_scaled * weights if weights is not None else X_scaled
 
     model = LocalOutlierFactor(
         n_neighbors=cfg.lof_n_neighbors,
         contamination=cfg.contamination,
         novelty=False,
     )
-    is_anomaly_raw = model.fit_predict(X_scaled)
+    is_anomaly_raw = model.fit_predict(X_input)
 
     # negative_outlier_factor_ はマイナス値（より負 = より異常）
     # 反転して「高いほど異常」なスコアにする
@@ -1483,17 +1578,26 @@ def main() -> None:
         feature_names = feature_df.columns.tolist()
         logger.debug(f"特徴量名 ({len(feature_names)}件): {feature_names}")
 
+        # 元カラム → 展開後特徴量のグループマップを構築
+        column_groups = build_column_groups(feature_names, encode_summaries)
+        logger.info(
+            f"特徴量グループ: {len(column_groups)}元カラム / {len(feature_names)}特徴量"
+        )
+
         # 5. Optunaチューニング（--tune かつ --label-col 指定時のみ）
+        lof_weights: Optional[np.ndarray] = None
         if cfg.tune:
             if cfg.label_col is None:
                 raise AnomalyDetectionError(
                     "--tune を使用するには --label-col でラベル列名を指定してください。"
                 )
-            cfg = tune_hyperparams(X_scaled, original_df, cfg)
+            cfg, lof_weights = tune_hyperparams(
+                X_scaled, original_df, cfg, feature_names, column_groups
+            )
 
         # 6. 異常検知モデル（IF または LOF）
         if cfg.method == "lof":
-            model, anomaly_score, is_anomaly = run_lof(X_scaled, cfg)
+            model, anomaly_score, is_anomaly = run_lof(X_scaled, cfg, weights=lof_weights)
         else:
             model, anomaly_score, is_anomaly = run_isolation_forest(X_scaled, cfg)
 
