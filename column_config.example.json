@@ -1,6 +1,15 @@
 {
   "_comment": "カラム設定サンプル。実際に使う場合は column_config.json にコピーして編集してください。",
 
+  "_comment_fields": {
+    "use":                   "true=使用 / false=除外",
+    "type":                  "numeric / date / categorical",
+    "encoding":              "ohe=One-Hot / frequency=頻度 / auto=カバレッジで自動判定",
+    "ohe_top_n":             "OHEする上位カテゴリ数（省略時はグローバル設定）",
+    "ohe_coverage_threshold":"autoモード時にOHEとみなすカバレッジ閾値（省略時はグローバル設定）",
+    "prefix_n":              "エンコード前に先頭N文字だけを使う（省略時は全文字）"
+  },
+
   "age":         {"use": true,  "type": "numeric"},
   "created_at":  {"use": true,  "type": "date"},
 
@@ -10,6 +19,8 @@
 
   "status":      {"use": true,  "type": "categorical", "encoding": "auto",
                   "ohe_top_n": 10, "ohe_coverage_threshold": 0.7},
+
+  "_comment_prefix_n": "product_code が 'ABC-001-XYZ' のような形式なら prefix_n=3 で先頭3文字('ABC')だけでOHE",
   "product_code":{"use": true,  "type": "categorical", "encoding": "ohe",
                   "ohe_top_n": 20, "prefix_n": 3},
 
