@@ -7,10 +7,13 @@
     "encoding":              "ohe=One-Hot / frequency=頻度 / auto=カバレッジで自動判定",
     "ohe_top_n":             "OHEする上位カテゴリ数（省略時はグローバル設定）",
     "ohe_coverage_threshold":"autoモード時にOHEとみなすカバレッジ閾値（省略時はグローバル設定）",
-    "prefix_n":              "エンコード前に先頭N文字だけを使う（省略時は全文字）"
+    "prefix_n":              "エンコード前に先頭N文字だけを使う（省略時は全文字）",
+    "log_transform":         "true=log1p変換（0以上の右歪み数値カラムに有効。負値があるとスキップ）"
   },
 
   "age":         {"use": true,  "type": "numeric"},
+  "_comment_log_transform": "金額など0以上・右歪み分布のカラムはlog_transform=trueで圧縮",
+  "amount":      {"use": true,  "type": "numeric", "log_transform": true},
   "created_at":  {"use": true,  "type": "date"},
 
   "region":      {"use": true,  "type": "categorical", "encoding": "ohe",       "ohe_top_n": 5},

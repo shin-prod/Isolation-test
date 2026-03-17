@@ -582,11 +582,12 @@ def preprocess(
         forced_topn      = spec.get("ohe_top_n")              # int | None
         forced_threshold = spec.get("ohe_coverage_threshold") # float | None
         prefix_n         = spec.get("prefix_n")               # int | None
+        log_transform    = bool(spec.get("log_transform", False))  # True: log1p変換
         logger.debug(
             f"カラム処理: {col} (dtype={dtype}, "
             f"forced_type={forced_type}, forced_enc={forced_enc}, "
             f"forced_topn={forced_topn}, forced_threshold={forced_threshold}, "
-            f"prefix_n={prefix_n})"
+            f"prefix_n={prefix_n}, log_transform={log_transform})"
         )
 
         # JSON で type=numeric が指定された場合は強制数値変換
@@ -642,6 +643,7 @@ def preprocess(
                 )
 
         else:
+
             logger.debug(f"  未知dtype({dtype}) → 数値変換試行: {col}")
             try:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -654,6 +656,21 @@ def preprocess(
                 logger.debug(traceback.format_exc())
                 excluded_cols.append(col)
                 df = df.drop(columns=[col])
+
+        # ---- 対数変換（log_transform=true かつ数値カラムのみ）----
+        if log_transform and col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
+            min_val = float(df[col].min())
+            if min_val < 0:
+                logger.warning(
+                    f"  log変換スキップ [{col}]: 負の値あり (min={min_val:.4g})"
+                )
+            else:
+                before_mean = float(df[col].mean())
+                df[col] = np.log1p(df[col])
+                logger.info(
+                    f"  対数変換 log1p [{col}]: "
+                    f"変換前 mean={before_mean:.4g} → 変換後 mean={df[col].mean():.4g}"
+                )
 
     # ---- 非数値カラムの最終除外 ----
     non_numeric = df.select_dtypes(exclude=[np.number]).columns.tolist()
