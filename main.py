@@ -1686,6 +1686,7 @@ def save_outputs(
     excluded_cols: list[str],
     encode_summaries: list[dict],
     cfg: Config,
+    column_groups: Optional[dict] = None,
 ) -> None:
     """結果ファイル一式を out/ フォルダに保存する。
 
@@ -1695,6 +1696,7 @@ def save_outputs(
         excluded_cols: 前処理・特徴量選択で除外したカラム名リスト
         encode_summaries: カテゴリ変数のエンコードサマリ
         cfg: 実行設定
+        column_groups: build_column_groups() の出力（元カラム → 展開後特徴量リスト）
     """
     cfg.out_dir.mkdir(exist_ok=True)
 
@@ -1713,6 +1715,16 @@ def save_outputs(
     result_df["is_anomaly"] = results.is_anomaly
     result_df["top_feature"] = results.top_feature_arr
     result_df["top_shap_value"] = results.top_shap_value_arr
+
+    # 元カラム名への逆引きマップ（OHE展開後 → 元カラム名）
+    feat_to_orig: dict[str, str] = {}
+    if column_groups:
+        for orig, feats in column_groups.items():
+            for f in feats:
+                feat_to_orig[f] = orig
+    result_df["top_feature_original"] = [
+        feat_to_orig.get(f, f) for f in results.top_feature_arr
+    ]
     out_path = cfg.out_dir / "result.csv"
     result_df.to_csv(out_path, index=True, index_label="index", encoding="utf-8-sig")
     logger.info(
@@ -1726,6 +1738,22 @@ def save_outputs(
         results.shap_df.to_csv(out_path, encoding="utf-8-sig")
         logger.info(f"出力: feature_contribution.csv ({len(results.shap_df)}件)")
         logger.debug(f"  → {out_path.resolve()}")
+
+        # ---- feature_contribution_original.csv（元カラム単位に集約）----
+        if column_groups:
+            orig_rows: dict[str, pd.Series] = {}
+            for orig, feats in column_groups.items():
+                cols_in_df = [f for f in feats if f in results.shap_df.columns]
+                if cols_in_df:
+                    orig_rows[orig] = results.shap_df[cols_in_df].sum(axis=1)
+            if orig_rows:
+                orig_contrib_df = pd.DataFrame(orig_rows, index=results.shap_df.index)
+                out_path = cfg.out_dir / "feature_contribution_original.csv"
+                orig_contrib_df.to_csv(out_path, encoding="utf-8-sig")
+                logger.info(
+                    f"出力: feature_contribution_original.csv "
+                    f"({len(orig_contrib_df)}件, {len(orig_contrib_df.columns)}カラム)"
+                )
     else:
         logger.info("特徴量寄与度出力スキップ")
 
@@ -2019,7 +2047,7 @@ def main() -> None:
             pca_coords=pca_coords,
             pca_dim_info=pca_dim_info,
         )
-        save_outputs(original_df, results, excluded_cols, encode_summaries, cfg)
+        save_outputs(original_df, results, excluded_cols, encode_summaries, cfg, column_groups)
 
         # 最終サマリ：flag付きデータの異常スコア位置
         if cfg.label_col is not None:
